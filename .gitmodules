@@ -1,0 +1,3 @@
+[submodule "link-cli"]
+	path = link-cli
+	url = git@github.com:stripe/link-cli
