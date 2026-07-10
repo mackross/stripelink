@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  platform:
+    name: Go 1.26.5 / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+      - name: Install Go 1.26.5
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.26.5
+          check-latest: false
+          cache: false
+      - name: Verify exact toolchain
+        shell: bash
+        run: test "$(go env GOVERSION)" = "go1.26.5"
+      - name: Verify formatting
+        shell: bash
+        run: test -z "$(gofmt -l -- *.go)"
+      - name: Verify modernizations
+        shell: bash
+        run: |
+          changes="$(go fix -diff ./...)"
+          if [[ -n "$changes" ]]; then
+            printf '%s\n' "$changes"
+            exit 1
+          fi
+      - name: Vet
+        run: go vet ./...
+      - name: Build
+        run: go build ./...
+      - name: Test
+        run: go test ./... -count=1
+      - name: Race test
+        run: go test -race ./... -count=1
+      - name: Compile examples and render docs
+        shell: bash
+        run: |
+          go test ./... -run='^Example' -count=1
+          go doc . >/dev/null
+      - name: Inspect module graph
+        run: go list -m all
+
+  race-stress:
+    name: Repeated race suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+      - name: Install Go 1.26.5
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.26.5
+          check-latest: false
+          cache: false
+      - name: Run repeated race suite
+        run: go test -race ./... -count=10
+
+  analysis:
+    name: Pinned security and static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+      - name: Install Go 1.26.5
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.26.5
+          check-latest: false
+          cache: false
+      - name: Install pinned analyzers
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          GOBIN="$RUNNER_TEMP/bin" go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          GOBIN="$RUNNER_TEMP/bin" go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          printf '%s\n' "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Staticcheck
+        shell: bash
+        run: |
+          staticcheck -version
+          staticcheck ./...
+      - name: Govulncheck
+        shell: bash
+        run: |
+          govulncheck -version
+          govulncheck ./...
+
+  fuzz:
+    name: Fuzz smoke / ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - FuzzSharedPaymentTokenUnmarshal
+          - FuzzExtractAPIErrorMessage
+          - FuzzWebBotURLParsingDoesNotDiscloseSecrets
+          - FuzzStorageStateDecode
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+      - name: Install Go 1.26.5
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.26.5
+          check-latest: false
+          cache: false
+      - name: Validate seed corpus
+        shell: bash
+        run: go test ./... -run='^${{ matrix.target }}$' -count=1
+      - name: Run fuzz smoke
+        shell: bash
+        run: go test . -run='^$' -fuzz='^${{ matrix.target }}$' -fuzztime=10s
