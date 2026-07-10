@@ -161,11 +161,11 @@ they do not duplicate every struct field mechanically.
 
 | ID | Observable behavior | Source | Evidence | Status |
 |---|---|---|---|---|
-| SAFE-01 | The full suite, including concurrent refresh/storage/cache/device-flow scenarios, passes repeatedly under the race detector and a stress count without goroutine leaks or deadlocks. | Go production gate | Implementation commit `0a14d94` passed `go test -race ./... -count=10`; targeted adversarial refresh/session and storage-cancellation tests passed repeated race/stress runs; `TestClientCancellationDrainsAllResourceWork` proves every blocked operation and transport drains under cancellation without sleeps or goroutine-count heuristics. | DONE |
+| SAFE-01 | The full suite, including concurrent refresh/storage/cache/device-flow scenarios, passes repeatedly under the race detector and a stress count without goroutine leaks or deadlocks. | Go production gate | [Hosted CI run 29102801918](https://github.com/mackross/stripelink/actions/runs/29102801918) passed `go test -race ./... -count=10` for implementation commit `080b957`; targeted adversarial refresh/session and storage-cancellation tests passed repeated race/stress runs; `TestClientCancellationDrainsAllResourceWork` proves every blocked operation and transport drains under cancellation without sleeps or goroutine-count heuristics. | DONE |
 | SAFE-02 | Fuzz tests cover shared-payment-token decoding, API error decoding/diagnostics, URL handling, and storage decoding with bounded allocation and credential-safe diagnostics. | Go production gate | `FuzzSharedPaymentTokenUnmarshal`; `FuzzExtractAPIErrorMessage`; `FuzzWebBotURLParsingDoesNotDiscloseSecrets`; `FuzzStorageStateDecode` | DONE |
 | SAFE-03 | HTTP reads default to 4 MiB and storage reads to 1 MiB. Overflow returns an explicit error, closes resources, preserves storage, and excludes truncated bytes from logs/diagnostics. | Go denial-of-service safety; resolved size policy | `TestCoreDoBoundsAndClosesResponse`; `TestFileStorageRejectsUnsafeOrInvalidFiles`; `TestExtractAPIErrorMessageRedactsCredentialFieldsAndBoundsDiagnostics`; metadata-only log tests | DONE |
 | SAFE-04 | Public methods reject nil contexts/required pointers without panic; nil/typed-nil custom dependencies are safely handled. | Go API robustness | `TestPublicResourceMethodsRejectNilContextAndUnconfiguredReceiver`; `TestSharedPaymentTokenUnmarshalRejectsNilReceiver`; `TestAuthNilContextsAndCredentialSafeErrors`; `TestReportsCreateNilContextAndZeroReceiver`; `TestSpendRequestsValidationBeforeHTTP`; `TestWebBotAuthSignURLValidatesBeforeAuthentication`; `TestNewClientRejectsTypedNilAuthStorage`; `TestNewClientRejectsTypedNilHTTPTransport` | DONE |
-| SAFE-05 | The exact patched Go 1.26.5 Linux/macOS/Windows matrix passes formatting, no-diff `go fix`, vet, examples, tests, repeated race runs, all fuzz targets, Staticcheck v0.7.0, govulncheck v1.6.0, dependency inspection, and docs; tests make no external calls. Go 1.26.1 is prohibited because the scanner found nine reachable standard-library vulnerabilities fixed through 1.26.5. | Release gate; resolved toolchain policy | Implementation commit `0a14d94` passed local Go 1.26.5 formatting, no-diff `go fix`, vet, build, tests, repeated race count 10, Staticcheck v0.7.0, govulncheck v1.6.0 with no vulnerabilities, four live fuzz runs, and Linux/Windows/FreeBSD cross-compilation; examples/docs/module inspection passed on its immediate predecessor with code-equivalent documentation changes. `.github/workflows/ci.yml` defines the least-privilege Linux/macOS/Windows matrix, but hosted final-commit CI has not run. | PENDING |
+| SAFE-05 | The exact patched Go 1.26.5 Linux/macOS/Windows matrix passes formatting, no-diff `go fix`, vet, examples, tests, repeated race runs, all fuzz targets, Staticcheck v0.7.0, govulncheck v1.6.0, dependency inspection, and docs; tests make no external calls. Go 1.26.1 is prohibited because the scanner found nine reachable standard-library vulnerabilities fixed through 1.26.5. | Release gate; resolved toolchain policy | [Hosted CI run 29102801918](https://github.com/mackross/stripelink/actions/runs/29102801918) passed all nine jobs for implementation commit `080b957`: the exact Go 1.26.5 Linux/macOS/Windows matrix, repeated race count 10, all four fuzz targets, Staticcheck v0.7.0, govulncheck v1.6.0, formatting, no-diff `go fix`, vet, build, tests, examples, docs, and module inspection. | DONE |
 | SAFE-06 | Package documentation covers credential handling, context/timeout ownership, retry limits, storage permissions/platform limits, logging, errors, and offline compiling auth/session and spend-retrieval examples. | Release gate | `README.md`; `doc.go`; `SECURITY.md`; `RELEASE.md`; `ExampleClient_deviceAuthentication`; `ExampleSpendRequestsResource_Retrieve` | DONE |
 
 ## Deliberate Go and safety deviations
@@ -222,9 +222,10 @@ the normative detailed record.
 
 ## Production-readiness gates
 
-Current evidence audit (2026-07-11): **72 DONE, 1 PENDING**. The remaining ID
-is `SAFE-05`; it requires hosted Linux/macOS/Windows CI evidence and is not
-implicitly waived.
+Current evidence audit (2026-07-11): **73 DONE, 0 PENDING**. Hosted CI run
+[29102801918](https://github.com/mackross/stripelink/actions/runs/29102801918)
+closes the final platform, tooling, fuzz, and repeated-race evidence gates for
+implementation commit `080b957`.
 
 Release is allowed only when:
 
