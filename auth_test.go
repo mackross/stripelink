@@ -32,7 +32,7 @@ func TestAuthInitiatePersistsAbsoluteExpiry(t *testing.T) {
 		if got, want := da.ExpiresAt, started.Add(10*time.Minute).UnixMilli(); got != want {
 			t.Fatalf("ExpiresAt = %d, want %d", got, want)
 		}
-		pending, err := storage.GetPendingDeviceAuth()
+		pending, err := loadStoredPendingDeviceAuth(storage)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -84,15 +84,42 @@ func TestAuthConcurrentInitiationRejectsSupersededResponse(t *testing.T) {
 	if err := <-firstResult; !errors.Is(err, errDeviceAuthSuperseded) {
 		t.Fatalf("older error = %v, want superseded", err)
 	}
-	pending, err := storage.GetPendingDeviceAuth()
+	pending, err := loadStoredPendingDeviceAuth(storage)
 	if err != nil || pending == nil || pending.DeviceCode != newer.DeviceCode || pending.DeviceCode != "second-device" {
 		t.Fatalf("pending = %#v, %v", pending, err)
 	}
 }
 
-func TestAuthStalePollCannotCommitAfterNewFlowStarts(t *testing.T) {
+func TestAuthConcurrentInitiationFailuresPreservePreviousPendingFlow(t *testing.T) {
 	storage := &MemoryStorage{}
-	if err := storage.SetPendingDeviceAuth(testPending("old-device")); err != nil {
+	previous := testPending("previous-device")
+	if err := storePendingDeviceAuth(storage, previous); err != nil {
+		t.Fatal(err)
+	}
+	transport := newSupersededInitiationTransport()
+	transport.secondStatus = http.StatusServiceUnavailable
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := testAuthResource(transport, storage).InitiateDeviceAuth(t.Context(), "first")
+		firstResult <- err
+	}()
+	<-transport.firstStarted
+	if _, err := testAuthResource(transport, storage).InitiateDeviceAuth(t.Context(), "second"); err == nil {
+		t.Fatal("newer initiation unexpectedly succeeded")
+	}
+	close(transport.releaseFirst)
+	if err := <-firstResult; !errors.Is(err, errDeviceAuthSuperseded) {
+		t.Fatalf("older error = %v, want superseded", err)
+	}
+	pending, err := loadStoredPendingDeviceAuth(storage)
+	if err != nil || pending == nil || pending.DeviceCode != previous.DeviceCode {
+		t.Fatalf("previous pending = %#v, %v", pending, err)
+	}
+}
+
+func TestAuthExistingPollMayFinishUntilNewFlowCommits(t *testing.T) {
+	storage := &MemoryStorage{}
+	if err := storePendingDeviceAuth(storage, testPending("old-device")); err != nil {
 		t.Fatal(err)
 	}
 	initTransport := newSupersededInitiationTransport()
@@ -106,20 +133,20 @@ func TestAuthStalePollCannotCommitAfterNewFlowStarts(t *testing.T) {
 
 	pollTransport := &recordingTransport{}
 	pollTransport.respond(http.StatusOK, `{"access_token":"stale","refresh_token":"stale-refresh","token_type":"bearer","expires_in":3600}`)
-	if _, err := testAuthResource(pollTransport, storage).PollDeviceAuthOnce(t.Context(), "old-device"); !errors.Is(err, errDeviceAuthSuperseded) {
-		t.Fatalf("stale poll error = %v", err)
+	if _, err := testAuthResource(pollTransport, storage).PollDeviceAuthOnce(t.Context(), "old-device"); err != nil {
+		t.Fatalf("existing poll error = %v", err)
 	}
-	if auth, err := storage.GetAuth(); err != nil || auth != nil {
-		t.Fatalf("stale poll committed auth = %#v, %v", auth, err)
+	if auth, err := loadStoredAuth(storage); err != nil || auth == nil || auth.AccessToken != "stale" {
+		t.Fatalf("existing poll auth = %#v, %v", auth, err)
 	}
 
 	close(initTransport.releaseFirst)
-	if err := <-newResult; err != nil {
-		t.Fatalf("new flow: %v", err)
+	if err := <-newResult; !errors.Is(err, errDeviceAuthSuperseded) {
+		t.Fatalf("new flow error = %v, want superseded", err)
 	}
-	pending, err := storage.GetPendingDeviceAuth()
-	if err != nil || pending == nil || pending.DeviceCode != "first-device" {
-		t.Fatalf("new pending = %#v, %v", pending, err)
+	pending, err := loadStoredPendingDeviceAuth(storage)
+	if err != nil || pending != nil {
+		t.Fatalf("pending after completed auth = %#v, %v", pending, err)
 	}
 }
 
@@ -225,10 +252,10 @@ func TestAuthTransportAndMalformedSuccessPreserveSessionAndNeverBearerRetry(t *t
 			storage := &MemoryStorage{}
 			originalAuth := storedToken("old-access", "old-refresh", time.Now().Add(time.Hour))
 			originalPending := testPending("old-device")
-			if err := storage.SetAuth(originalAuth); err != nil {
+			if err := storeAuth(storage, originalAuth); err != nil {
 				t.Fatal(err)
 			}
-			if err := storage.SetPendingDeviceAuth(originalPending); err != nil {
+			if err := storePendingDeviceAuth(storage, originalPending); err != nil {
 				t.Fatal(err)
 			}
 			rt := &recordingTransport{}
@@ -260,10 +287,10 @@ func TestAuthTransportAndMalformedSuccessPreserveSessionAndNeverBearerRetry(t *t
 			storage := &MemoryStorage{}
 			originalAuth := storedToken("old-access", "old-refresh", time.Now().Add(time.Hour))
 			originalPending := testPending("old-device")
-			if err := storage.SetAuth(originalAuth); err != nil {
+			if err := storeAuth(storage, originalAuth); err != nil {
 				t.Fatal(err)
 			}
-			if err := storage.SetPendingDeviceAuth(originalPending); err != nil {
+			if err := storePendingDeviceAuth(storage, originalPending); err != nil {
 				t.Fatal(err)
 			}
 			rt := &recordingTransport{}
@@ -359,8 +386,8 @@ func TestDeviceFlowVerboseLogsMetadataOnlyAndHostnameFailureFallsBack(t *testing
 
 func assertStoredSession(t *testing.T, storage AuthStorage, wantAuth *AuthTokens, wantPending *PendingDeviceAuth) {
 	t.Helper()
-	gotAuth, authErr := storage.GetAuth()
-	gotPending, pendingErr := storage.GetPendingDeviceAuth()
+	gotAuth, authErr := loadStoredAuth(storage)
+	gotPending, pendingErr := loadStoredPendingDeviceAuth(storage)
 	if authErr != nil || pendingErr != nil || gotAuth == nil || gotPending == nil || *gotAuth != *wantAuth || *gotPending != *wantPending {
 		t.Fatalf("stored session auth=%#v/%v pending=%#v/%v", gotAuth, authErr, gotPending, pendingErr)
 	}
@@ -389,6 +416,7 @@ type supersededInitiationTransport struct {
 	calls        int
 	firstStarted chan struct{}
 	releaseFirst chan struct{}
+	secondStatus int
 }
 
 func newSupersededInitiationTransport() *supersededInitiationTransport {
@@ -403,6 +431,13 @@ func (t *supersededInitiationTransport) RoundTrip(*http.Request) (*http.Response
 	if call == 1 {
 		close(t.firstStarted)
 		<-t.releaseFirst
+	}
+	if call == 2 && t.secondStatus != 0 {
+		return &http.Response{
+			StatusCode: t.secondStatus,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"error":"temporarily_unavailable"}`)),
+		}, nil
 	}
 	device := "first-device"
 	if call == 2 {
@@ -421,7 +456,7 @@ func TestAuthPollOnceClassifiesAndPersists(t *testing.T) {
 		rt := &recordingTransport{}
 		rt.respond(http.StatusOK, `{"access_token":"new-access","refresh_token":"new-refresh","token_type":"bearer","expires_in":3600}`)
 		storage := &MemoryStorage{}
-		if err := storage.SetPendingDeviceAuth(testPending("device-secret")); err != nil {
+		if err := storePendingDeviceAuth(storage, testPending("device-secret")); err != nil {
 			t.Fatal(err)
 		}
 		auth := testAuthResource(rt, storage)
@@ -433,8 +468,8 @@ func TestAuthPollOnceClassifiesAndPersists(t *testing.T) {
 		if tokens.AccessToken != "new-access" || tokens.RefreshToken != "new-refresh" || tokens.ExpiresAt == 0 {
 			t.Fatalf("tokens = %#v", tokens)
 		}
-		stored, _ := storage.GetAuth()
-		pending, _ := storage.GetPendingDeviceAuth()
+		stored, _ := loadStoredAuth(storage)
+		pending, _ := loadStoredPendingDeviceAuth(storage)
 		if stored == nil || stored.AccessToken != "new-access" || pending != nil {
 			t.Fatalf("stored = %#v, pending = %#v", stored, pending)
 		}
@@ -477,7 +512,7 @@ func TestAuthPollTerminalClearsOnlyMatchingPending(t *testing.T) {
 			rt := &recordingTransport{}
 			rt.respond(http.StatusBadRequest, `{"error":"`+tc.code+`"}`)
 			storage := &MemoryStorage{}
-			if err := storage.SetPendingDeviceAuth(testPending("same")); err != nil {
+			if err := storePendingDeviceAuth(storage, testPending("same")); err != nil {
 				t.Fatal(err)
 			}
 			_, err := testAuthResource(rt, storage).PollDeviceAuthOnce(t.Context(), "same")
@@ -485,7 +520,7 @@ func TestAuthPollTerminalClearsOnlyMatchingPending(t *testing.T) {
 			if !ok || apiErr.Code != tc.code || apiErr.Message != tc.message {
 				t.Fatalf("error = %#v", err)
 			}
-			pending, _ := storage.GetPendingDeviceAuth()
+			pending, _ := loadStoredPendingDeviceAuth(storage)
 			if pending != nil {
 				t.Fatalf("pending not cleared: %#v", pending)
 			}
@@ -495,11 +530,11 @@ func TestAuthPollTerminalClearsOnlyMatchingPending(t *testing.T) {
 	rt := &recordingTransport{}
 	rt.respond(http.StatusBadRequest, `{"error":"expired_token"}`)
 	storage := &MemoryStorage{}
-	if err := storage.SetPendingDeviceAuth(testPending("newer")); err != nil {
+	if err := storePendingDeviceAuth(storage, testPending("newer")); err != nil {
 		t.Fatal(err)
 	}
 	_, _ = testAuthResource(rt, storage).PollDeviceAuthOnce(t.Context(), "older")
-	pending, _ := storage.GetPendingDeviceAuth()
+	pending, _ := loadStoredPendingDeviceAuth(storage)
 	if pending == nil || pending.DeviceCode != "newer" {
 		t.Fatalf("unrelated pending was cleared: %#v", pending)
 	}
@@ -512,7 +547,7 @@ func TestAuthPollUsesAbsoluteExpiryAndCumulativeSlowDown(t *testing.T) {
 		rt.respond(http.StatusBadRequest, `{"error":"slow_down"}`)
 		rt.respond(http.StatusOK, `{"access_token":"access","refresh_token":"refresh","token_type":"bearer","expires_in":3600}`)
 		storage := &MemoryStorage{}
-		if err := storage.SetPendingDeviceAuth(testPending("device")); err != nil {
+		if err := storePendingDeviceAuth(storage, testPending("device")); err != nil {
 			t.Fatal(err)
 		}
 		auth := testAuthResource(rt, storage)
@@ -553,10 +588,10 @@ func TestAuthRefreshRevokeAndLogout(t *testing.T) {
 	rt.respond(http.StatusNoContent, "")
 	rt.respond(http.StatusNoContent, "")
 	storage := &MemoryStorage{}
-	if err := storage.SetAuth(&AuthTokens{AccessToken: "a1", RefreshToken: "r1", ExpiresIn: 3600, TokenType: "bearer"}); err != nil {
+	if err := storeAuth(storage, &AuthTokens{AccessToken: "a1", RefreshToken: "r1", ExpiresIn: 3600, TokenType: "bearer"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := storage.SetPendingDeviceAuth(testPending("d")); err != nil {
+	if err := storePendingDeviceAuth(storage, testPending("d")); err != nil {
 		t.Fatal(err)
 	}
 	auth := testAuthResource(rt, storage)
@@ -572,8 +607,8 @@ func TestAuthRefreshRevokeAndLogout(t *testing.T) {
 	if err := auth.Logout(t.Context()); err != nil {
 		t.Fatalf("Logout: %v", err)
 	}
-	stored, _ := storage.GetAuth()
-	pending, _ := storage.GetPendingDeviceAuth()
+	stored, _ := loadStoredAuth(storage)
+	pending, _ := loadStoredPendingDeviceAuth(storage)
 	if stored != nil || pending != nil {
 		t.Fatalf("logout retained auth=%#v pending=%#v", stored, pending)
 	}
@@ -603,7 +638,7 @@ func TestAuthResumeUsesPersistedAbsoluteExpiry(t *testing.T) {
 		pending := testPending("resumed-device")
 		pending.Interval = 3
 		pending.ExpiresAt = time.Now().Add(10 * time.Second).UnixMilli()
-		if err := storage.SetPendingDeviceAuth(pending); err != nil {
+		if err := storePendingDeviceAuth(storage, pending); err != nil {
 			t.Fatal(err)
 		}
 		rt := &recordingTransport{}
@@ -670,7 +705,7 @@ func TestAuthRejectsMalformedSuccessWithoutMutatingStorage(t *testing.T) {
 			rt := &recordingTransport{}
 			rt.respond(http.StatusOK, `{}`)
 			storage := &MemoryStorage{}
-			if err := storage.SetAuth(&AuthTokens{AccessToken: "old", RefreshToken: "old-refresh", ExpiresIn: 3600, TokenType: "bearer"}); err != nil {
+			if err := storeAuth(storage, &AuthTokens{AccessToken: "old", RefreshToken: "old-refresh", ExpiresIn: 3600, TokenType: "bearer"}); err != nil {
 				t.Fatal(err)
 			}
 			auth := testAuthResource(rt, storage)
@@ -686,7 +721,7 @@ func TestAuthRejectsMalformedSuccessWithoutMutatingStorage(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected malformed success error")
 			}
-			stored, _ := storage.GetAuth()
+			stored, _ := loadStoredAuth(storage)
 			if stored == nil || stored.AccessToken != "old" {
 				t.Fatalf("stored auth changed: %#v", stored)
 			}
@@ -707,16 +742,16 @@ func TestAuthStorageFailuresNeverClaimSuccess(t *testing.T) {
 	rt = &recordingTransport{}
 	rt.respond(http.StatusOK, `{"access_token":"new","refresh_token":"new-refresh","token_type":"bearer","expires_in":3600}`)
 	storage = &failingAuthStorage{setAuthErr: setAuthFailure}
-	if err := storage.MemoryStorage.SetAuth(&AuthTokens{AccessToken: "old", RefreshToken: "old-refresh", TokenType: "bearer", ExpiresIn: 3600}); err != nil {
+	if err := storeAuth(&storage.MemoryStorage, &AuthTokens{AccessToken: "old", RefreshToken: "old-refresh", TokenType: "bearer", ExpiresIn: 3600}); err != nil {
 		t.Fatal(err)
 	}
-	if err := storage.MemoryStorage.SetPendingDeviceAuth(testPending("device")); err != nil {
+	if err := storePendingDeviceAuth(&storage.MemoryStorage, testPending("device")); err != nil {
 		t.Fatal(err)
 	}
 	if tokens, err := testAuthResource(rt, storage).PollDeviceAuthOnce(t.Context(), "device"); tokens != nil || !errors.Is(err, setAuthFailure) {
 		t.Fatalf("poll = %#v, %v", tokens, err)
 	}
-	stored, err := storage.MemoryStorage.GetAuth()
+	stored, err := loadStoredAuth(&storage.MemoryStorage)
 	if err != nil || stored.AccessToken != "old" || stored.RefreshToken != "old-refresh" {
 		t.Fatalf("stored after failure = %#v, %v", stored, err)
 	}
@@ -725,7 +760,7 @@ func TestAuthStorageFailuresNeverClaimSuccess(t *testing.T) {
 func TestAuthPollCancellationPreservesPending(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		storage := &MemoryStorage{}
-		if err := storage.SetPendingDeviceAuth(testPending("device")); err != nil {
+		if err := storePendingDeviceAuth(storage, testPending("device")); err != nil {
 			t.Fatal(err)
 		}
 		rt := &recordingTransport{}
@@ -741,7 +776,7 @@ func TestAuthPollCancellationPreservesPending(t *testing.T) {
 		if !errors.Is(err, cause) {
 			t.Fatalf("error = %v, want context cause", err)
 		}
-		pending, getErr := storage.GetPendingDeviceAuth()
+		pending, getErr := loadStoredPendingDeviceAuth(storage)
 		if getErr != nil || pending == nil || pending.DeviceCode != "device" {
 			t.Fatalf("pending = %#v, %v", pending, getErr)
 		}
@@ -758,14 +793,14 @@ func TestAuthLogoutFailureRetainsSession(t *testing.T) {
 		body        string
 		clearAllErr error
 	}{
-		{name: "revocation", status: http.StatusBadRequest, body: `{"error":"invalid_token"}`},
+		{name: "revocation", status: http.StatusBadRequest, body: `{"error":"invalid_grant"}`},
 		{name: "clear", status: http.StatusNoContent, clearAllErr: errors.New("clear failed")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rt := &recordingTransport{}
 			rt.respond(tc.status, tc.body)
 			storage := &failingAuthStorage{clearAllErr: tc.clearAllErr}
-			if err := storage.MemoryStorage.SetAuth(&AuthTokens{AccessToken: "access", RefreshToken: "refresh", TokenType: "bearer", ExpiresIn: 3600}); err != nil {
+			if err := storeAuth(&storage.MemoryStorage, &AuthTokens{AccessToken: "access", RefreshToken: "refresh", TokenType: "bearer", ExpiresIn: 3600}); err != nil {
 				t.Fatal(err)
 			}
 			auth := testAuthResource(rt, storage)
@@ -773,13 +808,74 @@ func TestAuthLogoutFailureRetainsSession(t *testing.T) {
 			if err := auth.Logout(t.Context()); err == nil {
 				t.Fatal("Logout unexpectedly succeeded")
 			}
-			stored, err := storage.MemoryStorage.GetAuth()
+			stored, err := loadStoredAuth(&storage.MemoryStorage)
 			if err != nil || stored == nil || stored.RefreshToken != "refresh" {
 				t.Fatalf("stored = %#v, %v", stored, err)
 			}
 		})
 	}
 }
+
+func TestAuthLogoutClearsAlreadyInvalidTokenAndIgnoresPostRevokeCancellation(t *testing.T) {
+	t.Run("already invalid", func(t *testing.T) {
+		rt := &recordingTransport{}
+		rt.respond(http.StatusBadRequest, `{"error":"invalid_token"}`)
+		storage := &MemoryStorage{}
+		if err := storeAuth(storage, storedToken("access", "refresh", time.Now().Add(time.Hour))); err != nil {
+			t.Fatal(err)
+		}
+		auth := testAuthResource(rt, storage)
+		auth.c.managesSession = true
+		if err := auth.Logout(t.Context()); err != nil {
+			t.Fatalf("Logout: %v", err)
+		}
+		if state, err := storage.Load(t.Context()); err != nil || state.Auth != nil {
+			t.Fatalf("state after logout = %#v, %v", state, err)
+		}
+	})
+
+	t.Run("caller canceled after revocation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		storage := &MemoryStorage{}
+		if err := storeAuth(storage, storedToken("access", "refresh", time.Now().Add(time.Hour))); err != nil {
+			t.Fatal(err)
+		}
+		rt := roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusNoContent,
+				Header:     make(http.Header),
+				Body:       &cancelOnEOFReadCloser{Reader: strings.NewReader(""), cancel: cancel},
+			}, nil
+		})
+		auth := testAuthResource(rt, storage)
+		auth.c.managesSession = true
+		if err := auth.Logout(ctx); err != nil {
+			t.Fatalf("Logout: %v", err)
+		}
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Fatalf("caller context = %v", ctx.Err())
+		}
+		if state, err := storage.Load(t.Context()); err != nil || state.Auth != nil {
+			t.Fatalf("state after logout = %#v, %v", state, err)
+		}
+	})
+}
+
+type cancelOnEOFReadCloser struct {
+	io.Reader
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (r *cancelOnEOFReadCloser) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if errors.Is(err, io.EOF) {
+		r.once.Do(r.cancel)
+	}
+	return n, err
+}
+
+func (*cancelOnEOFReadCloser) Close() error { return nil }
 
 func testAuthResource(rt http.RoundTripper, storage AuthStorage) *AuthResource {
 	return &AuthResource{c: &core{
@@ -807,89 +903,44 @@ func testPending(deviceCode string) *PendingDeviceAuth {
 // fail without partially mutating it.
 type failingAuthStorage struct {
 	MemoryStorage
-	muFail          sync.Mutex
-	getAuthErr      error
-	setAuthErr      error
-	setPendingErr   error
-	clearPendingErr error
-	clearAllErr     error
+	muFail        sync.Mutex
+	getAuthErr    error
+	setAuthErr    error
+	setPendingErr error
+	clearAllErr   error
 }
 
-func (s *failingAuthStorage) GetAuth() (*AuthTokens, error) {
+func (s *failingAuthStorage) Load(ctx context.Context) (*AuthStorageState, error) {
 	s.muFail.Lock()
 	err := s.getAuthErr
 	s.muFail.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	return s.MemoryStorage.GetAuth()
+	return s.MemoryStorage.Load(ctx)
 }
 
-func (s *failingAuthStorage) SetAuth(tokens *AuthTokens) error {
-	s.muFail.Lock()
-	err := s.setAuthErr
-	s.muFail.Unlock()
-	if err != nil {
-		return err
-	}
-	return s.MemoryStorage.SetAuth(tokens)
-}
-
-func (s *failingAuthStorage) SetPendingDeviceAuth(pending *PendingDeviceAuth) error {
-	s.muFail.Lock()
-	err := s.setPendingErr
-	s.muFail.Unlock()
-	if err != nil {
-		return err
-	}
-	return s.MemoryStorage.SetPendingDeviceAuth(pending)
-}
-
-func (s *failingAuthStorage) ClearPendingDeviceAuth() error {
-	s.muFail.Lock()
-	err := s.clearPendingErr
-	s.muFail.Unlock()
-	if err != nil {
-		return err
-	}
-	return s.MemoryStorage.ClearPendingDeviceAuth()
-}
-
-func (s *failingAuthStorage) ClearAll() error {
-	s.muFail.Lock()
-	err := s.clearAllErr
-	s.muFail.Unlock()
-	if err != nil {
-		return err
-	}
-	return s.MemoryStorage.ClearAll()
-}
-
-func (s *failingAuthStorage) Update(ctx context.Context, update func(*AuthStorageState) error) error {
+func (s *failingAuthStorage) Transact(ctx context.Context, update func(*AuthStorageState) error) error {
 	s.muFail.Lock()
 	getAuthErr := s.getAuthErr
 	setAuthErr := s.setAuthErr
 	setPendingErr := s.setPendingErr
-	clearPendingErr := s.clearPendingErr
 	clearAllErr := s.clearAllErr
 	s.muFail.Unlock()
 	if getAuthErr != nil {
 		return getAuthErr
 	}
-	return s.MemoryStorage.Update(ctx, func(state *AuthStorageState) error {
+	return s.MemoryStorage.Transact(ctx, func(state *AuthStorageState) error {
 		beforeAuth := cloneAuth(state.Auth)
 		beforePending := clonePending(state.PendingDeviceAuth)
 		if err := update(state); err != nil {
 			return err
 		}
-		if setAuthErr != nil && !authTokensEqual(beforeAuth, state.Auth) {
+		if setAuthErr != nil && !sameAuthTokens(beforeAuth, state.Auth) {
 			return setAuthErr
 		}
 		if setPendingErr != nil && !pendingDeviceAuthEqual(beforePending, state.PendingDeviceAuth) && state.PendingDeviceAuth != nil {
 			return setPendingErr
-		}
-		if clearPendingErr != nil && beforePending != nil && state.PendingDeviceAuth == nil {
-			return clearPendingErr
 		}
 		if clearAllErr != nil && beforeAuth != nil && state.Auth == nil && state.PendingDeviceAuth == nil {
 			return clearAllErr
@@ -898,8 +949,14 @@ func (s *failingAuthStorage) Update(ctx context.Context, update func(*AuthStorag
 	})
 }
 
-func authTokensEqual(a, b *AuthTokens) bool {
-	return (a == nil && b == nil) || (a != nil && b != nil && *a == *b)
+func (s *failingAuthStorage) Clear(ctx context.Context) error {
+	s.muFail.Lock()
+	err := s.clearAllErr
+	s.muFail.Unlock()
+	if err != nil {
+		return err
+	}
+	return s.MemoryStorage.Clear(ctx)
 }
 
 func pendingDeviceAuthEqual(a, b *PendingDeviceAuth) bool {

@@ -67,11 +67,18 @@ promised to be the CLI's path and no automatic discovery or migration occurs.
 Do not point the SDK at a shared file unless ownership and writer coordination
 are understood.
 
-A custom `AuthStorage` must implement `Update` as one complete-session atomic
-transaction, use defensive copies, obey cancellation before commit, and hold
-its transaction across processes through durable persistence. A store that
-implements only individually synchronized getters/setters can lose a rotated
-single-use refresh token and is not safe for this SDK.
+A custom `AuthStorage` must implement `Transact` as one complete-state atomic
+transaction, return defensive copies from `Load`, obey cancellation before
+commit, and hold its transaction across processes through durable persistence.
+A store that implements `Load` followed by an independently synchronized write
+can lose a rotated single-use refresh token and is not safe for this SDK.
+Transaction callbacks must be local and side-effect-free; the SDK never holds a
+storage transaction open across network I/O.
+
+Automatic refresh is single-flight within one Client, not across independent
+processes or Client values. A service sharing one credential set must centralize
+refresh through one long-lived Client rather than relying on the storage lock to
+serialize network requests.
 
 ## Network boundary
 
@@ -82,8 +89,11 @@ retry once after a `401`; mutations are never automatically replayed.
 
 Responses are bounded to 4 MiB by default. Applications may configure a
 different positive `MaxResponseBodyBytes`, but should use the smallest value
-that accommodates their validated workload. Every network operation relies on
-the caller's context deadline; the SDK does not install a client-wide timeout.
+that accommodates their validated workload. Ordinary network operations rely
+on the caller's context deadline; the SDK does not install a client-wide
+timeout. A started automatic token refresh is detached for at most 30 seconds
+so a successful remote rotation can be committed after its caller stops
+waiting.
 
 ## Dependency and toolchain policy
 

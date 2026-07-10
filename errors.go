@@ -84,13 +84,8 @@ func (e *APIError) Error() string {
 	return sanitizeDiagnosticText(e.Message, "remote API request failed")
 }
 
-// String returns the same credential-safe, bounded diagnostic as Error.
-func (e *APIError) String() string { return e.Error() }
-
-// GoString returns a credential-safe structural summary. RawBody and Details
-// deliberately remain available as explicit fields for callers that need to
-// inspect them, but implicit formatting never includes their contents.
-func (e *APIError) GoString() string {
+// safeSummary returns a structural summary without exposing RawBody or Details.
+func (e *APIError) safeSummary() string {
 	if e == nil {
 		return "(*stripelink.APIError)(nil)"
 	}
@@ -102,7 +97,7 @@ func (e *APIError) GoString() string {
 // RawBody or Details.
 func (e *APIError) Format(state fmt.State, verb rune) {
 	if verb == 'v' && state.Flag('#') {
-		_, _ = state.Write([]byte(e.GoString()))
+		_, _ = state.Write([]byte(e.safeSummary()))
 		return
 	}
 	_, _ = state.Write([]byte(e.Error()))
@@ -136,12 +131,9 @@ func (e *TransportError) Error() string {
 	return truncateDiagnostic(fmt.Sprintf("Request failed: %s %s", method, safeURLDiagnostic(e.URL)))
 }
 
-// String returns the credential-safe transport diagnostic.
-func (e *TransportError) String() string { return e.Error() }
-
-// GoString returns a structural summary without URL credentials, query
+// safeSummary returns a structural summary without URL credentials, query
 // values, fragments, or the possibly sensitive underlying error message.
-func (e *TransportError) GoString() string {
+func (e *TransportError) safeSummary() string {
 	if e == nil {
 		return "(*stripelink.TransportError)(nil)"
 	}
@@ -152,7 +144,7 @@ func (e *TransportError) GoString() string {
 // Format prevents fmt's %#v form from exposing URL or cause details.
 func (e *TransportError) Format(state fmt.State, verb rune) {
 	if verb == 'v' && state.Flag('#') {
-		_, _ = state.Write([]byte(e.GoString()))
+		_, _ = state.Write([]byte(e.safeSummary()))
 		return
 	}
 	_, _ = state.Write([]byte(e.Error()))

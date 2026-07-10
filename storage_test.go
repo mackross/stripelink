@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-func TestAuthStorageUpdateIsAtomicAndContextAware(t *testing.T) {
+func TestAuthStorageTransactIsAtomicAndContextAware(t *testing.T) {
 	for name, pair := range map[string]func(*testing.T) (AuthStorage, AuthStorage){
 		"memory": func(t *testing.T) (AuthStorage, AuthStorage) {
 			storage := &MemoryStorage{}
@@ -32,14 +32,14 @@ func TestAuthStorageUpdateIsAtomicAndContextAware(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			writer, reader := pair(t)
-			if err := writer.SetPendingDeviceAuth(validPending()); err != nil {
+			if err := storePendingDeviceAuth(writer, validPending()); err != nil {
 				t.Fatal(err)
 			}
 			entered := make(chan struct{})
 			release := make(chan struct{})
 			writeDone := make(chan error, 1)
 			go func() {
-				writeDone <- writer.Update(context.Background(), func(state *AuthStorageState) error {
+				writeDone <- writer.Transact(context.Background(), func(state *AuthStorageState) error {
 					state.Auth = validAuth()
 					state.PendingDeviceAuth = nil
 					close(entered)
@@ -52,24 +52,67 @@ func TestAuthStorageUpdateIsAtomicAndContextAware(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			cancel()
 			called := false
-			err := reader.Update(ctx, func(*AuthStorageState) error {
+			err := reader.Transact(ctx, func(*AuthStorageState) error {
 				called = true
 				return nil
 			})
 			if !errors.Is(err, context.Canceled) || called {
-				t.Fatalf("canceled Update = %v, called=%v", err, called)
+				t.Fatalf("canceled Transact = %v, called=%v", err, called)
 			}
 
 			close(release)
 			if err := <-writeDone; err != nil {
 				t.Fatal(err)
 			}
-			auth, authErr := reader.GetAuth()
-			pending, pendingErr := reader.GetPendingDeviceAuth()
-			if authErr != nil || pendingErr != nil || auth == nil || pending != nil {
-				t.Fatalf("atomic state auth=%#v/%v pending=%#v/%v", auth, authErr, pending, pendingErr)
+			state, stateErr := reader.Load(t.Context())
+			auth, pending := state.Auth, state.PendingDeviceAuth
+			if stateErr != nil || auth == nil || pending != nil {
+				t.Fatalf("atomic state auth=%#v pending=%#v error=%v", auth, pending, stateErr)
 			}
 		})
+	}
+}
+
+func TestAuthStorageOperationsValidateContextAndCallback(t *testing.T) {
+	for name, storage := range storageImplementations(t) {
+		t.Run(name, func(t *testing.T) {
+			if _, err := storage.Load(nilContext()); !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("Load(nil) error = %v", err)
+			}
+			if err := storage.Transact(t.Context(), nil); !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("Transact(nil callback) error = %v", err)
+			}
+			if err := storage.Clear(nilContext()); !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("Clear(nil) error = %v", err)
+			}
+		})
+	}
+
+	file, err := NewFileStorage(filepath.Join(t.TempDir(), "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Delete(nilContext()); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("Delete(nil) error = %v", err)
+	}
+}
+
+func TestFileStorageDeleteHonorsCancellationWhileWaitingForLock(t *testing.T) {
+	storage, err := NewFileStorage(filepath.Join(t.TempDir(), "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.gate.lock(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer storage.gate.unlock()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- storage.Delete(ctx) }()
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Delete error = %v, want context cancellation", err)
 	}
 }
 
@@ -117,15 +160,15 @@ func storageImplementations(t *testing.T) map[string]AuthStorage {
 	}
 }
 
-func TestAuthStorageValueSemanticsAndExpiry(t *testing.T) {
+func TestAuthStorageValueSemantics(t *testing.T) {
 	for name, storage := range storageImplementations(t) {
 		t.Run(name, func(t *testing.T) {
 			auth := validAuth()
-			if err := storage.SetAuth(auth); err != nil {
+			if err := storeAuth(storage, auth); err != nil {
 				t.Fatal(err)
 			}
 			auth.AccessToken = "mutated"
-			got, err := storage.GetAuth()
+			got, err := loadStoredAuth(storage)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -133,17 +176,17 @@ func TestAuthStorageValueSemanticsAndExpiry(t *testing.T) {
 				t.Fatalf("stored auth = %#v", got)
 			}
 			got.AccessToken = "mutated-again"
-			got, _ = storage.GetAuth()
+			got, _ = loadStoredAuth(storage)
 			if got.AccessToken != "at_secret" {
-				t.Fatalf("GetAuth leaked storage-owned value: %#v", got)
+				t.Fatalf("Load leaked storage-owned auth: %#v", got)
 			}
 
 			pending := validPending()
-			if err := storage.SetPendingDeviceAuth(pending); err != nil {
+			if err := storePendingDeviceAuth(storage, pending); err != nil {
 				t.Fatal(err)
 			}
 			pending.DeviceCode = "mutated"
-			gotPending, err := storage.GetPendingDeviceAuth()
+			gotPending, err := loadStoredPendingDeviceAuth(storage)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -151,19 +194,19 @@ func TestAuthStorageValueSemanticsAndExpiry(t *testing.T) {
 				t.Fatalf("stored pending = %#v", gotPending)
 			}
 			gotPending.DeviceCode = "mutated-again"
-			gotPending, _ = storage.GetPendingDeviceAuth()
+			gotPending, _ = loadStoredPendingDeviceAuth(storage)
 			if gotPending.DeviceCode != "dc_secret" {
-				t.Fatalf("GetPendingDeviceAuth leaked storage-owned value: %#v", gotPending)
+				t.Fatalf("Load leaked storage-owned pending auth: %#v", gotPending)
 			}
 
 			expired := validPending()
 			expired.ExpiresAt = time.Now().Add(-time.Millisecond).UnixMilli()
-			if err := storage.SetPendingDeviceAuth(expired); err != nil {
+			if err := storePendingDeviceAuth(storage, expired); err != nil {
 				t.Fatal(err)
 			}
-			gotPending, err = storage.GetPendingDeviceAuth()
-			if err != nil || gotPending != nil {
-				t.Fatalf("expired pending = %#v, %v", gotPending, err)
+			gotPending, err = loadStoredPendingDeviceAuth(storage)
+			if err != nil || gotPending == nil || gotPending.ExpiresAt != expired.ExpiresAt {
+				t.Fatalf("stored expired pending = %#v, %v", gotPending, err)
 			}
 		})
 	}
@@ -174,20 +217,20 @@ func TestAuthStorageRejectsInvalidInputWithoutMutation(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			original := validAuth()
 			original.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
-			if err := storage.SetAuth(original); err != nil {
+			if err := storeAuth(storage, original); err != nil {
 				t.Fatal(err)
 			}
-			for _, invalid := range []*AuthTokens{nil, {}, {AccessToken: "at", RefreshToken: "rt", ExpiresIn: -1, TokenType: "Bearer"}} {
-				if err := storage.SetAuth(invalid); !errors.Is(err, ErrInvalidArgument) {
-					t.Fatalf("SetAuth(%#v) error = %v", invalid, err)
+			for _, invalid := range []*AuthTokens{{}, {AccessToken: "at", RefreshToken: "rt", ExpiresIn: -1, TokenType: "Bearer"}} {
+				if err := storeAuth(storage, invalid); !errors.Is(err, ErrInvalidArgument) {
+					t.Fatalf("store invalid auth %#v error = %v", invalid, err)
 				}
 			}
-			got, err := storage.GetAuth()
+			got, err := loadStoredAuth(storage)
 			if err != nil || *got != *original {
 				t.Fatalf("state changed: %#v, %v", got, err)
 			}
-			if err := storage.SetPendingDeviceAuth(nil); !errors.Is(err, ErrInvalidArgument) {
-				t.Fatalf("SetPendingDeviceAuth(nil) error = %v", err)
+			if err := storePendingDeviceAuth(storage, nil); !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("store nil pending auth error = %v", err)
 			}
 		})
 	}
@@ -196,43 +239,43 @@ func TestAuthStorageRejectsInvalidInputWithoutMutation(t *testing.T) {
 func TestAuthStorageClearOperations(t *testing.T) {
 	for name, storage := range storageImplementations(t) {
 		t.Run(name, func(t *testing.T) {
-			if err := storage.SetAuth(validAuth()); err != nil {
+			if err := storeAuth(storage, validAuth()); err != nil {
 				t.Fatal(err)
 			}
-			if err := storage.SetPendingDeviceAuth(validPending()); err != nil {
+			if err := storePendingDeviceAuth(storage, validPending()); err != nil {
 				t.Fatal(err)
 			}
-			if err := storage.ClearAuth(); err != nil {
+			if err := clearStoredAuth(storage); err != nil {
 				t.Fatal(err)
 			}
-			if err := storage.ClearAuth(); err != nil {
+			if err := clearStoredAuth(storage); err != nil {
 				t.Fatal(err)
 			}
-			if auth, _ := storage.GetAuth(); auth != nil {
+			if auth, _ := loadStoredAuth(storage); auth != nil {
 				t.Fatalf("auth not cleared: %#v", auth)
 			}
-			if pending, _ := storage.GetPendingDeviceAuth(); pending == nil {
-				t.Fatal("ClearAuth cleared pending state")
+			if pending, _ := loadStoredPendingDeviceAuth(storage); pending == nil {
+				t.Fatal("clearing auth also cleared pending state")
 			}
-			if err := storage.ClearPendingDeviceAuth(); err != nil {
+			if err := clearStoredPendingDeviceAuth(storage); err != nil {
 				t.Fatal(err)
 			}
-			if err := storage.SetAuth(validAuth()); err != nil {
+			if err := storeAuth(storage, validAuth()); err != nil {
 				t.Fatal(err)
 			}
-			if err := storage.SetPendingDeviceAuth(validPending()); err != nil {
+			if err := storePendingDeviceAuth(storage, validPending()); err != nil {
 				t.Fatal(err)
 			}
-			if err := storage.ClearPendingDeviceAuth(); err != nil {
+			if err := clearStoredPendingDeviceAuth(storage); err != nil {
 				t.Fatal(err)
 			}
-			if auth, _ := storage.GetAuth(); auth == nil {
-				t.Fatal("ClearPendingDeviceAuth cleared auth state")
+			if auth, _ := loadStoredAuth(storage); auth == nil {
+				t.Fatal("clearing pending state also cleared auth")
 			}
-			if err := storage.ClearAll(); err != nil {
+			if err := storage.Clear(t.Context()); err != nil {
 				t.Fatal(err)
 			}
-			if err := storage.ClearAll(); err != nil {
+			if err := storage.Clear(t.Context()); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -249,7 +292,7 @@ func TestFileStorageSchemaPermissionsAndUnknownState(t *testing.T) {
 	if storage.Path() != path {
 		t.Fatalf("Path = %q", storage.Path())
 	}
-	if err := storage.SetAuth(validAuth()); err != nil {
+	if err := storeAuth(storage, validAuth()); err != nil {
 		t.Fatal(err)
 	}
 	assertMode(t, dir, 0o700)
@@ -274,11 +317,11 @@ func TestFileStorageSchemaPermissionsAndUnknownState(t *testing.T) {
 	if err := os.WriteFile(path, []byte(fixture), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := storage.GetAuth(); err != nil {
+	if _, err := loadStoredAuth(storage); err != nil {
 		t.Fatal(err)
 	}
 	assertMode(t, path, 0o600)
-	if err := storage.SetPendingDeviceAuth(validPending()); err != nil {
+	if err := storePendingDeviceAuth(storage, validPending()); err != nil {
 		t.Fatal(err)
 	}
 	data, _ = os.ReadFile(path)
@@ -301,7 +344,7 @@ func TestFileStorageRejectsUnsafeOrInvalidFiles(t *testing.T) {
 				t.Fatal(err)
 			}
 			storage, _ := NewFileStorage(path)
-			if _, err := storage.GetAuth(); err == nil {
+			if _, err := loadStoredAuth(storage); err == nil {
 				t.Fatal("expected explicit decode error")
 			}
 		})
@@ -314,11 +357,11 @@ func TestFileStorageRejectsUnsafeOrInvalidFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 		storage, _ := NewFileStorage(path)
-		if _, err := storage.GetAuth(); !errors.Is(err, ErrStorageTooLarge) {
+		if _, err := loadStoredAuth(storage); !errors.Is(err, ErrStorageTooLarge) {
 			t.Fatalf("error = %v", err)
 		}
-		if err := storage.SetAuth(validAuth()); !errors.Is(err, ErrStorageTooLarge) {
-			t.Fatalf("SetAuth error = %v", err)
+		if err := storeAuth(storage, validAuth()); !errors.Is(err, ErrStorageTooLarge) {
+			t.Fatalf("Transact error = %v", err)
 		}
 		got, err := os.ReadFile(path)
 		if err != nil || !bytes.Equal(got, original) {
@@ -328,7 +371,7 @@ func TestFileStorageRejectsUnsafeOrInvalidFiles(t *testing.T) {
 
 	t.Run("directory", func(t *testing.T) {
 		storage, _ := NewFileStorage(t.TempDir())
-		if _, err := storage.GetAuth(); err == nil {
+		if _, err := loadStoredAuth(storage); err == nil {
 			t.Fatal("expected non-regular-file error")
 		}
 	})
@@ -339,8 +382,8 @@ func TestFileStorageRejectsUnsafeOrInvalidFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 		storage, _ := NewFileStorage(filepath.Join(parent, "auth.json"))
-		if _, err := storage.GetAuth(); err == nil || !strings.Contains(err.Error(), "inspect auth storage file") {
-			t.Fatalf("GetAuth error = %v", err)
+		if _, err := loadStoredAuth(storage); err == nil || !strings.Contains(err.Error(), "inspect auth storage file") {
+			t.Fatalf("Load error = %v", err)
 		}
 	})
 
@@ -356,14 +399,14 @@ func TestFileStorageRejectsUnsafeOrInvalidFiles(t *testing.T) {
 				t.Fatal(err)
 			}
 			storage, _ := NewFileStorage(link)
-			if _, err := storage.GetAuth(); err == nil {
+			if _, err := loadStoredAuth(storage); err == nil {
 				t.Fatal("expected symlink rejection")
 			}
-			if err := storage.Delete(); err == nil {
+			if err := deleteStoredFile(storage); err == nil {
 				t.Fatal("expected Delete symlink rejection")
 			}
-			if err := storage.ClearAll(); err == nil {
-				t.Fatal("expected ClearAll symlink rejection")
+			if err := clearStoredState(storage); err == nil {
+				t.Fatal("expected Clear symlink rejection")
 			}
 			if _, err := os.Stat(target); err != nil {
 				t.Fatalf("symlink target touched: %v", err)
@@ -381,7 +424,7 @@ func TestFileStorageRejectsUnsafeOrInvalidFiles(t *testing.T) {
 				t.Fatal(err)
 			}
 			storage, _ := NewFileStorage(path)
-			if err := storage.SetAuth(validAuth()); err == nil {
+			if err := storeAuth(storage, validAuth()); err == nil {
 				t.Fatal("expected lock symlink rejection")
 			}
 			got, err := os.ReadFile(target)
@@ -401,7 +444,7 @@ func TestFileStorageFailedWritePreservesLastValidState(t *testing.T) {
 	storage, _ := NewFileStorage(path)
 	original := validAuth()
 	original.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
-	if err := storage.SetAuth(original); err != nil {
+	if err := storeAuth(storage, original); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(dir, 0o500); err != nil {
@@ -410,10 +453,10 @@ func TestFileStorageFailedWritePreservesLastValidState(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 	replacement := validAuth()
 	replacement.AccessToken = "at_replacement"
-	if err := storage.SetAuth(replacement); err == nil {
+	if err := storeAuth(storage, replacement); err == nil {
 		t.Fatal("expected write failure in non-writable directory")
 	}
-	got, err := storage.GetAuth()
+	got, err := loadStoredAuth(storage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -501,7 +544,7 @@ func TestFileStorageAtomicWriteFaultBoundaries(t *testing.T) {
 			}
 			original := validAuth()
 			original.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
-			if err := storage.SetAuth(original); err != nil {
+			if err := storeAuth(storage, original); err != nil {
 				t.Fatal(err)
 			}
 
@@ -509,7 +552,7 @@ func TestFileStorageAtomicWriteFaultBoundaries(t *testing.T) {
 			replacement := validAuth()
 			replacement.AccessToken = "at_replacement"
 			replacement.ExpiresAt = original.ExpiresAt + 1
-			err = storage.SetAuth(replacement)
+			err = storeAuth(storage, replacement)
 			if !errors.Is(err, injected) {
 				t.Fatalf("error = %v, want injected cause", err)
 			}
@@ -518,7 +561,7 @@ func TestFileStorageAtomicWriteFaultBoundaries(t *testing.T) {
 			}
 
 			storage.ops = defaultStorageFileOps()
-			got, err := storage.GetAuth()
+			got, err := loadStoredAuth(storage)
 			if err != nil {
 				t.Fatalf("last valid credentials unreadable: %v", err)
 			}
@@ -541,7 +584,7 @@ func TestFileStorageAtomicWriteFaultBoundaries(t *testing.T) {
 	}
 }
 
-func TestFileStorageUpdateCancellationBeforeCommit(t *testing.T) {
+func TestFileStorageTransactCancellationBeforeCommit(t *testing.T) {
 	for _, boundary := range []string{"temporary write", "temporary sync"} {
 		t.Run(boundary, func(t *testing.T) {
 			dir := t.TempDir()
@@ -552,7 +595,7 @@ func TestFileStorageUpdateCancellationBeforeCommit(t *testing.T) {
 			}
 			original := validAuth()
 			original.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
-			if err := storage.SetAuth(original); err != nil {
+			if err := storeAuth(storage, original); err != nil {
 				t.Fatal(err)
 			}
 
@@ -578,12 +621,12 @@ func TestFileStorageUpdateCancellationBeforeCommit(t *testing.T) {
 			replacement := validAuth()
 			replacement.AccessToken = "at_must_not_persist"
 			replacement.ExpiresAt = original.ExpiresAt + 1
-			err = storage.Update(ctx, func(state *AuthStorageState) error {
+			err = storage.Transact(ctx, func(state *AuthStorageState) error {
 				state.Auth = replacement
 				return nil
 			})
 			if !errors.Is(err, context.Canceled) {
-				t.Fatalf("Update error = %v, want context cancellation", err)
+				t.Fatalf("Transact error = %v, want context cancellation", err)
 			}
 
 			storage.ops = defaultStorageFileOps()
@@ -593,7 +636,7 @@ func TestFileStorageUpdateCancellationBeforeCommit(t *testing.T) {
 			}
 			for range 100 {
 				runtime.Gosched()
-				got, err := reader.GetAuth()
+				got, err := loadStoredAuth(reader)
 				if err != nil {
 					t.Fatalf("last valid credentials unreadable: %v", err)
 				}
@@ -612,14 +655,14 @@ func TestFileStorageUpdateCancellationBeforeCommit(t *testing.T) {
 	}
 }
 
-func TestFileStorageUpdateCancellationAfterRenameReportsDurabilityError(t *testing.T) {
+func TestFileStorageTransactCancellationAfterRenameReportsDurabilityError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "auth.json")
 	storage, err := NewFileStorage(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := storage.SetAuth(validAuth()); err != nil {
+	if err := storeAuth(storage, validAuth()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -636,19 +679,19 @@ func TestFileStorageUpdateCancellationAfterRenameReportsDurabilityError(t *testi
 	storage.ops.syncDirectory = func(string) error { return durabilityFailure }
 	replacement := validAuth()
 	replacement.AccessToken = "at_committed"
-	err = storage.Update(ctx, func(state *AuthStorageState) error {
+	err = storage.Transact(ctx, func(state *AuthStorageState) error {
 		state.Auth = replacement
 		return nil
 	})
 	if !errors.Is(err, durabilityFailure) {
-		t.Fatalf("Update error = %v, want durability failure", err)
+		t.Fatalf("Transact error = %v, want durability failure", err)
 	}
 	if errors.Is(err, context.Canceled) {
 		t.Fatalf("post-commit cancellation masked commit state: %v", err)
 	}
 
 	reader, _ := NewFileStorage(path)
-	got, err := reader.GetAuth()
+	got, err := loadStoredAuth(reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -660,19 +703,19 @@ func TestFileStorageUpdateCancellationAfterRenameReportsDurabilityError(t *testi
 func TestFileStorageMissingAndDeleteAreIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "auth.json")
 	storage, _ := NewFileStorage(path)
-	if auth, err := storage.GetAuth(); err != nil || auth != nil {
+	if auth, err := loadStoredAuth(storage); err != nil || auth != nil {
 		t.Fatalf("missing auth = %#v, %v", auth, err)
 	}
-	if err := storage.Delete(); err != nil {
+	if err := deleteStoredFile(storage); err != nil {
 		t.Fatal(err)
 	}
-	if err := storage.SetAuth(validAuth()); err != nil {
+	if err := storeAuth(storage, validAuth()); err != nil {
 		t.Fatal(err)
 	}
-	if err := storage.Delete(); err != nil {
+	if err := deleteStoredFile(storage); err != nil {
 		t.Fatal(err)
 	}
-	if err := storage.Delete(); err != nil {
+	if err := deleteStoredFile(storage); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -682,13 +725,13 @@ func TestFileStorageCoordinatesInstances(t *testing.T) {
 	a, _ := NewFileStorage(path)
 	b, _ := NewFileStorage(path)
 	for range 20 {
-		if err := a.ClearAll(); err != nil {
+		if err := clearStoredState(a); err != nil {
 			t.Fatal(err)
 		}
 		start := make(chan struct{})
 		errs := make(chan error, 2)
-		go func() { <-start; errs <- a.SetAuth(validAuth()) }()
-		go func() { <-start; errs <- b.SetPendingDeviceAuth(validPending()) }()
+		go func() { <-start; errs <- storeAuth(a, validAuth()) }()
+		go func() { <-start; errs <- storePendingDeviceAuth(b, validPending()) }()
 		close(start)
 		if err := <-errs; err != nil {
 			t.Fatal(err)
@@ -696,8 +739,8 @@ func TestFileStorageCoordinatesInstances(t *testing.T) {
 		if err := <-errs; err != nil {
 			t.Fatal(err)
 		}
-		auth, authErr := a.GetAuth()
-		pending, pendingErr := b.GetPendingDeviceAuth()
+		auth, authErr := loadStoredAuth(a)
+		pending, pendingErr := loadStoredPendingDeviceAuth(b)
 		if authErr != nil || pendingErr != nil || auth == nil || pending == nil {
 			t.Fatalf("lost update: auth=%#v/%v pending=%#v/%v", auth, authErr, pending, pendingErr)
 		}
@@ -717,9 +760,9 @@ func TestFileStorageCoordinatesProcesses(t *testing.T) {
 		for range 50 {
 			switch role {
 			case "auth":
-				err = storage.SetAuth(validAuth())
+				err = storeAuth(storage, validAuth())
 			case "pending":
-				err = storage.SetPendingDeviceAuth(validPending())
+				err = storePendingDeviceAuth(storage, validPending())
 			default:
 				t.Fatalf("unknown helper role %q", role)
 			}
@@ -756,14 +799,14 @@ func TestFileStorageCoordinatesProcesses(t *testing.T) {
 		}
 	}
 	storage, _ := NewFileStorage(path)
-	auth, authErr := storage.GetAuth()
-	pending, pendingErr := storage.GetPendingDeviceAuth()
+	auth, authErr := loadStoredAuth(storage)
+	pending, pendingErr := loadStoredPendingDeviceAuth(storage)
 	if authErr != nil || pendingErr != nil || auth == nil || pending == nil {
 		t.Fatalf("lost cross-process update: auth=%#v/%v pending=%#v/%v", auth, authErr, pending, pendingErr)
 	}
 }
 
-func TestFileStorageUpdateCoordinatesProcesses(t *testing.T) {
+func TestFileStorageTransactCoordinatesProcesses(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("cross-process advisory locking is unavailable")
 	}
@@ -773,7 +816,7 @@ func TestFileStorageUpdateCoordinatesProcesses(t *testing.T) {
 			t.Fatal(err)
 		}
 		for range 25 {
-			err := storage.Update(t.Context(), func(state *AuthStorageState) error {
+			err := storage.Transact(t.Context(), func(state *AuthStorageState) error {
 				value, err := strconv.Atoi(state.Auth.AccessToken)
 				if err != nil {
 					return err
@@ -792,7 +835,7 @@ func TestFileStorageUpdateCoordinatesProcesses(t *testing.T) {
 	storage, _ := NewFileStorage(path)
 	initial := validAuth()
 	initial.AccessToken = "0"
-	if err := storage.SetAuth(initial); err != nil {
+	if err := storeAuth(storage, initial); err != nil {
 		t.Fatal(err)
 	}
 	executable, err := os.Executable()
@@ -802,7 +845,7 @@ func TestFileStorageUpdateCoordinatesProcesses(t *testing.T) {
 	commands := make([]*exec.Cmd, 2)
 	outputs := make([]bytes.Buffer, 2)
 	for i := range commands {
-		commands[i] = exec.Command(executable, "-test.run=^TestFileStorageUpdateCoordinatesProcesses$")
+		commands[i] = exec.Command(executable, "-test.run=^TestFileStorageTransactCoordinatesProcesses$")
 		commands[i].Env = append(os.Environ(), "STRIPELINK_UPDATE_HELPER=1", "STRIPELINK_STORAGE_HELPER_PATH="+path)
 		commands[i].Stdout = &outputs[i]
 		commands[i].Stderr = &outputs[i]
@@ -815,7 +858,7 @@ func TestFileStorageUpdateCoordinatesProcesses(t *testing.T) {
 			t.Fatalf("update helper failed: %v\n%s", err, outputs[i].Bytes())
 		}
 	}
-	auth, err := storage.GetAuth()
+	auth, err := loadStoredAuth(storage)
 	if err != nil || auth == nil || auth.AccessToken != "50" {
 		t.Fatalf("transaction result = %#v, %v", auth, err)
 	}
@@ -826,11 +869,11 @@ func TestMemoryStorageConcurrentAccess(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 50 {
 		wg.Add(2)
-		go func() { defer wg.Done(); _ = storage.SetAuth(validAuth()); _, _ = storage.GetAuth() }()
+		go func() { defer wg.Done(); _ = storeAuth(&storage, validAuth()); _, _ = loadStoredAuth(&storage) }()
 		go func() {
 			defer wg.Done()
-			_ = storage.SetPendingDeviceAuth(validPending())
-			_, _ = storage.GetPendingDeviceAuth()
+			_ = storePendingDeviceAuth(&storage, validPending())
+			_, _ = loadStoredPendingDeviceAuth(&storage)
 		}()
 	}
 	wg.Wait()
@@ -870,7 +913,7 @@ func TestZeroOptionClientReadsExactDefaultPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := seed.SetAuth(storedToken("seeded-default", "seeded-refresh", time.Now().Add(time.Hour))); err != nil {
+	if err := storeAuth(seed, storedToken("seeded-default", "seeded-refresh", time.Now().Add(time.Hour))); err != nil {
 		t.Fatal(err)
 	}
 

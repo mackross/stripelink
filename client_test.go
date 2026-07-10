@@ -228,7 +228,7 @@ func TestNewClientTokenSourceCompletePrecedenceAndLazyFailure(t *testing.T) {
 	freshStorage := func(t *testing.T, token string) *MemoryStorage {
 		t.Helper()
 		storage := &MemoryStorage{}
-		if err := storage.SetAuth(storedToken(token, "stored-refresh", time.Now().Add(time.Hour))); err != nil {
+		if err := storeAuth(storage, storedToken(token, "stored-refresh", time.Now().Add(time.Hour))); err != nil {
 			t.Fatal(err)
 		}
 		return storage

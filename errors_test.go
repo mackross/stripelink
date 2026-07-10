@@ -50,7 +50,7 @@ func TestAPIErrorFormattingNeverExposesResponseCredentials(t *testing.T) {
 		Details: []byte(`{"refresh_token":"` + token + `"}`),
 	}
 
-	formatted := []string{err.Error(), err.String(), err.GoString()}
+	formatted := []string{err.Error()}
 	for _, format := range []string{"%s", "%v", "%+v", "%#v"} {
 		formatted = append(formatted, fmt.Sprintf(format, err))
 	}
@@ -83,7 +83,7 @@ func TestTransportErrorFormattingSanitizesURLAndCause(t *testing.T) {
 		Err:    errors.New(secret),
 	}
 	for _, got := range []string{
-		err.Error(), err.String(), err.GoString(),
+		err.Error(),
 		fmt.Sprintf("%s", err), fmt.Sprintf("%v", err), fmt.Sprintf("%+v", err), fmt.Sprintf("%#v", err),
 	} {
 		if strings.Contains(got, secret) || strings.Contains(got, "buyer") || strings.Contains(got, "token=") {

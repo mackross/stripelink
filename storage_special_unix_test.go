@@ -25,13 +25,13 @@ func TestFileStorageRejectsDeviceAndFIFOWithoutOpening(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := storage.GetAuth(); err == nil || !strings.Contains(err.Error(), "not a regular file") {
-				t.Fatalf("GetAuth error = %v", err)
+			if _, err := loadStoredAuth(storage); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+				t.Fatalf("Load error = %v", err)
 			}
-			if err := storage.SetAuth(validAuth()); err == nil || !strings.Contains(err.Error(), "not a regular file") {
-				t.Fatalf("SetAuth error = %v", err)
+			if err := storeAuth(storage, validAuth()); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+				t.Fatalf("Transact error = %v", err)
 			}
-			if err := storage.Delete(); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			if err := deleteStoredFile(storage); err == nil || !strings.Contains(err.Error(), "not a regular file") {
 				t.Fatalf("Delete error = %v", err)
 			}
 		})
@@ -55,7 +55,7 @@ func TestFileStorageReportsUnreadablePath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = storage.GetAuth()
+	_, err = loadStoredAuth(storage)
 	if err == nil {
 		t.Skip("test process can bypass directory permissions")
 	}

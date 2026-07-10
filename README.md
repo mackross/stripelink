@@ -19,7 +19,9 @@ it with live financial data.
   CI currently qualifies the exact 1.26.5 patch release.
 - No third-party runtime dependencies.
 - A caller-supplied context deadline for every operation that can block. The
-  SDK deliberately does not impose an HTTP client timeout.
+  SDK does not impose a client-wide HTTP timeout. A started automatic token
+  refresh may continue for up to 30 seconds after its caller stops waiting so a
+  successful remote rotation can be persisted.
 
 ## Installation
 
@@ -68,15 +70,24 @@ if _, err := client.Auth.PollDeviceAuth(ctx, device); err != nil {
 
 `ResumeDeviceAuth` resumes a still-valid pending flow after a process restart.
 `Logout` revokes the SDK-owned persisted refresh token and clears the session
-only after successful revocation. The low-level `RefreshToken` and
+after successful revocation or an `invalid_token` response indicating it was
+already revoked. The low-level `RefreshToken` and
 `RevokeToken` methods operate only on the token passed to them and do not
 change storage. Static tokens and custom token providers remain caller-owned.
 
 For ephemeral or test processes, pass `&stripelink.MemoryStorage{}`. Custom
 `AuthStorage` implementations must be concurrency-safe, defensively copy
-values, and implement `Update` as one atomic complete-session transaction. A
-persistent implementation must hold the transaction lock across cooperating
-processes through durable commit so a rotated refresh token cannot be lost.
+values returned by `Load` and supplied to `Transact`, and commit `Transact` as
+one atomic complete-state operation. A persistent implementation must hold the
+transaction lock across cooperating processes through durable commit so a
+rotated refresh token cannot be lost. Transaction callbacks must contain only
+local state changes—never network I/O or external side effects. `Clear`
+atomically removes the complete stored auth state.
+
+Automatic refresh is single-flight within one `Client`. Independent clients
+sharing the same storage may issue refresh requests concurrently; services that
+need global serialization—such as Toolbox—should own one long-lived Client in
+the daemon or service process.
 
 ## Spend retrieval
 
@@ -102,6 +113,25 @@ request, err = client.SpendRequests.Retrieve(
 Executable, offline versions of the authentication/session and retrieval
 flows live in [example_test.go](./example_test.go).
 
+## Live test-mode example
+
+The explicit `examples/testmode-spend-request` command exercises the normal
+Link service with `test: true`. It is not part of `go test` or CI. The command
+reads an existing link-cli credential file, can perform an interactive device
+login, selects a saved payment method, creates a test-mode spend request,
+prints its approval URL, waits for user approval, prints the complete returned
+test card, and cancels the request.
+
+```sh
+go run ./examples/testmode-spend-request \
+  -auth-file "$HOME/Library/Preferences/link-cli-nodejs/config.json" \
+  -login
+```
+
+Omit `-login` while the stored CLI session remains refreshable. The program
+never prints OAuth tokens, but it deliberately prints test-mode payment
+credentials; do not adapt that output behavior to live-mode requests.
+
 ## Request and retry behavior
 
 - Safe authenticated reads (`GET`) may be retried once after a `401`, using a
@@ -121,8 +151,9 @@ flows live in [example_test.go](./example_test.go).
 
 ## Optional request fields
 
-Optional request scalars are pointers deliberately: `nil` omits a field while
-a non-nil pointer preserves explicit `false`, `0`, or `""`. For optional
+Create-only optional scalars use ordinary zero values where zero, false, or an
+empty string is equivalent to omission. Update scalars remain pointers where
+callers must distinguish omission from an explicit clear or zero. For optional
 slices, `nil` omits the field and a non-nil empty slice sends `[]`. Required
 identifiers and structurally impossible inputs are validated locally; unknown
 string-enum values are preserved for forward compatibility.

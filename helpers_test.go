@@ -24,6 +24,63 @@ import (
 // intent explicit while leaving staticcheck's SA1012 enabled globally.
 func nilContext() context.Context { return nil }
 
+func loadStoredAuth(storage AuthStorage) (*AuthTokens, error) {
+	state, err := storage.Load(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return cloneAuth(state.Auth), nil
+}
+
+func loadStoredPendingDeviceAuth(storage AuthStorage) (*PendingDeviceAuth, error) {
+	state, err := storage.Load(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return clonePending(state.PendingDeviceAuth), nil
+}
+
+func storeAuth(storage AuthStorage, auth *AuthTokens) error {
+	return storage.Transact(context.Background(), func(state *AuthStorageState) error {
+		state.Auth = auth
+		return nil
+	})
+}
+
+func storePendingDeviceAuth(storage AuthStorage, pending *PendingDeviceAuth) error {
+	return storage.Transact(context.Background(), func(state *AuthStorageState) error {
+		if pending == nil {
+			return fmt.Errorf("%w: pending device auth is required", ErrInvalidArgument)
+		}
+		state.PendingDeviceAuth = pending
+		state.DeviceAuthGeneration = nextGeneration(state.DeviceAuthGeneration)
+		return nil
+	})
+}
+
+func clearStoredAuth(storage AuthStorage) error {
+	return storage.Transact(context.Background(), func(state *AuthStorageState) error {
+		state.Auth = nil
+		return nil
+	})
+}
+
+func clearStoredPendingDeviceAuth(storage AuthStorage) error {
+	return storage.Transact(context.Background(), func(state *AuthStorageState) error {
+		state.PendingDeviceAuth = nil
+		state.DeviceAuthGeneration = nextGeneration(state.DeviceAuthGeneration)
+		return nil
+	})
+}
+
+func clearStoredState(storage AuthStorage) error {
+	return storage.Clear(context.Background())
+}
+
+func deleteStoredFile(storage *FileStorage) error {
+	return storage.Delete(context.Background())
+}
+
 // recordedRequest captures one HTTP request seen by a recordingTransport.
 type recordedRequest struct {
 	Method string

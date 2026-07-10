@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-func TestTokenProviderRefreshCoalescesAcrossClientsSharingStorage(t *testing.T) {
+func TestTokenProviderConcurrentClientsConvergeOnStoredGeneration(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		storages func(*testing.T) (AuthStorage, AuthStorage)
@@ -36,7 +36,7 @@ func TestTokenProviderRefreshCoalescesAcrossClientsSharingStorage(t *testing.T) 
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a, b := tc.storages(t)
-			if err := a.SetAuth(storedToken("old", "single-use", time.Now().Add(-time.Hour))); err != nil {
+			if err := storeAuth(a, storedToken("old", "single-use", time.Now().Add(-time.Hour))); err != nil {
 				t.Fatal(err)
 			}
 			transport := newBlockingRefreshTransport()
@@ -54,6 +54,13 @@ func TestTokenProviderRefreshCoalescesAcrossClientsSharingStorage(t *testing.T) 
 				}()
 			}
 			<-transport.started
+			deadline := time.Now().Add(5 * time.Second)
+			for transport.calls() < 2 {
+				if time.Now().After(deadline) {
+					t.Fatalf("refresh calls = %d, want both clients in flight", transport.calls())
+				}
+				runtime.Gosched()
+			}
 			close(transport.release)
 			for range 2 {
 				if err := <-errs; err != nil {
@@ -63,8 +70,8 @@ func TestTokenProviderRefreshCoalescesAcrossClientsSharingStorage(t *testing.T) 
 					t.Errorf("token = %q, want new", token)
 				}
 			}
-			if got := transport.calls(); got != 1 {
-				t.Fatalf("refresh calls = %d, want 1", got)
+			if got := transport.calls(); got != 2 {
+				t.Fatalf("refresh calls = %d, want 2 independent clients", got)
 			}
 		})
 	}
@@ -81,7 +88,7 @@ func TestTokenProviderFreshExpiredAndMissing(t *testing.T) {
 		if _, err := provider.token(t.Context(), AccessTokenRequest{}); !errors.Is(err, ErrNotAuthenticated) {
 			t.Fatalf("missing error = %v", err)
 		}
-		if err := storage.SetAuth(storedToken("current", "refresh", time.Now().Add(61*time.Second))); err != nil {
+		if err := storeAuth(storage, storedToken("current", "refresh", time.Now().Add(61*time.Second))); err != nil {
 			t.Fatal(err)
 		}
 		got, err := provider.token(t.Context(), AccessTokenRequest{})
@@ -93,7 +100,7 @@ func TestTokenProviderFreshExpiredAndMissing(t *testing.T) {
 		if err != nil || got != "fresh" || len(rt.Requests()) != 1 {
 			t.Fatalf("refreshed token = %q, %v; requests=%d", got, err, len(rt.Requests()))
 		}
-		stored, _ := storage.GetAuth()
+		stored, _ := loadStoredAuth(storage)
 		if stored == nil || stored.AccessToken != "fresh" || stored.RefreshToken != "rotated" {
 			t.Fatalf("stored tokens = %#v", stored)
 		}
@@ -102,7 +109,7 @@ func TestTokenProviderFreshExpiredAndMissing(t *testing.T) {
 
 func TestTokenProviderRefreshIsSingleFlightAndGenerationAware(t *testing.T) {
 	storage := &MemoryStorage{}
-	if err := storage.SetAuth(storedToken("old", "refresh", time.Now().Add(-time.Hour))); err != nil {
+	if err := storeAuth(storage, storedToken("old", "refresh", time.Now().Add(-time.Hour))); err != nil {
 		t.Fatal(err)
 	}
 	transport := newBlockingRefreshTransport()
@@ -148,7 +155,7 @@ func TestTokenProviderRefreshIsSingleFlightAndGenerationAware(t *testing.T) {
 
 func TestTokenProviderWaiterCancellationDoesNotCancelSharedRefresh(t *testing.T) {
 	storage := &MemoryStorage{}
-	if err := storage.SetAuth(storedToken("old", "refresh", time.Now().Add(-time.Hour))); err != nil {
+	if err := storeAuth(storage, storedToken("old", "refresh", time.Now().Add(-time.Hour))); err != nil {
 		t.Fatal(err)
 	}
 	transport := newBlockingRefreshTransport()
@@ -179,9 +186,9 @@ func TestTokenProviderWaiterCancellationDoesNotCancelSharedRefresh(t *testing.T)
 	}
 }
 
-func TestTokenProviderFinalCancellationPreventsLatePersistence(t *testing.T) {
+func TestTokenProviderFinalCancellationStillPersistsSuccessfulRotation(t *testing.T) {
 	storage := &MemoryStorage{}
-	if err := storage.SetAuth(storedToken("old", "refresh", time.Now().Add(-time.Hour))); err != nil {
+	if err := storeAuth(storage, storedToken("old", "refresh", time.Now().Add(-time.Hour))); err != nil {
 		t.Fatal(err)
 	}
 	transport := newBlockingRefreshTransport()
@@ -197,9 +204,12 @@ func TestTokenProviderFinalCancellationPreventsLatePersistence(t *testing.T) {
 	if err := <-result; !errors.Is(err, context.Canceled) {
 		t.Fatalf("token error = %v", err)
 	}
-	<-transport.finished
-	stored, err := storage.GetAuth()
-	if err != nil || stored.AccessToken != "old" || stored.RefreshToken != "refresh" {
+	close(transport.release)
+	if token, err := provider.token(t.Context(), AccessTokenRequest{}); err != nil || token != "new" {
+		t.Fatalf("completed refresh = %q, %v", token, err)
+	}
+	stored, err := loadStoredAuth(storage)
+	if err != nil || stored.AccessToken != "new" || stored.RefreshToken != "rotated" {
 		t.Fatalf("stored after cancellation = %#v, %v", stored, err)
 	}
 }
@@ -214,7 +224,7 @@ func TestTokenProviderStorageFailuresAndRetryAfterRefreshFailure(t *testing.T) {
 
 	writeFailure := errors.New("write failed")
 	storage = &failingAuthStorage{setAuthErr: writeFailure}
-	if err := storage.MemoryStorage.SetAuth(storedToken("old", "refresh", time.Now().Add(-time.Hour))); err != nil {
+	if err := storeAuth(&storage.MemoryStorage, storedToken("old", "refresh", time.Now().Add(-time.Hour))); err != nil {
 		t.Fatal(err)
 	}
 	rt := &recordingTransport{}
@@ -223,13 +233,13 @@ func TestTokenProviderStorageFailuresAndRetryAfterRefreshFailure(t *testing.T) {
 	if token, err := provider.token(t.Context(), AccessTokenRequest{}); !errors.Is(err, writeFailure) || token != "" {
 		t.Fatalf("write failure token = %q, error = %v", token, err)
 	}
-	stored, _ := storage.MemoryStorage.GetAuth()
+	stored, _ := loadStoredAuth(&storage.MemoryStorage)
 	if stored.AccessToken != "old" {
 		t.Fatalf("failed persistence clobbered auth: %#v", stored)
 	}
 
 	storage = &failingAuthStorage{}
-	if err := storage.MemoryStorage.SetAuth(storedToken("old", "refresh", time.Now().Add(-time.Hour))); err != nil {
+	if err := storeAuth(&storage.MemoryStorage, storedToken("old", "refresh", time.Now().Add(-time.Hour))); err != nil {
 		t.Fatal(err)
 	}
 	rt = &recordingTransport{}
@@ -248,7 +258,7 @@ func TestTokenProviderStorageFailuresAndRetryAfterRefreshFailure(t *testing.T) {
 
 func TestTokenProviderConcurrentWaitersShareFailedRefreshAndLaterRetry(t *testing.T) {
 	storage := &MemoryStorage{}
-	if err := storage.SetAuth(storedToken("old", "refresh", time.Now().Add(-time.Hour))); err != nil {
+	if err := storeAuth(storage, storedToken("old", "refresh", time.Now().Add(-time.Hour))); err != nil {
 		t.Fatal(err)
 	}
 	transport := newFailingThenSuccessfulRefreshTransport()
@@ -303,7 +313,7 @@ func TestTokenProviderConcurrentWaitersShareFailedRefreshAndLaterRetry(t *testin
 	if got := transport.calls(); got != 1 {
 		t.Fatalf("failed refresh calls = %d, want 1", got)
 	}
-	stored, err := storage.GetAuth()
+	stored, err := loadStoredAuth(storage)
 	if err != nil || stored == nil || stored.AccessToken != "old" || stored.RefreshToken != "refresh" {
 		t.Fatalf("failed refresh changed session: %#v, %v", stored, err)
 	}
@@ -351,21 +361,18 @@ func (t *failingThenSuccessfulRefreshTransport) calls() int {
 }
 
 type blockingRefreshTransport struct {
-	mu       sync.Mutex
-	count    int
-	started  chan struct{}
-	release  chan struct{}
-	finished chan struct{}
-	once     sync.Once
-	finish   sync.Once
+	mu      sync.Mutex
+	count   int
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
 }
 
 func newBlockingRefreshTransport() *blockingRefreshTransport {
-	return &blockingRefreshTransport{started: make(chan struct{}), release: make(chan struct{}), finished: make(chan struct{})}
+	return &blockingRefreshTransport{started: make(chan struct{}), release: make(chan struct{})}
 }
 
 func (t *blockingRefreshTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	defer t.finish.Do(func() { close(t.finished) })
 	t.mu.Lock()
 	t.count++
 	t.mu.Unlock()

@@ -102,9 +102,6 @@ func (c Card) String() string {
 	return fmt.Sprintf("Card{ID:<redacted> Brand:<redacted> ExpMonth:%d ExpYear:%d Number:<redacted> CVC:<redacted> BillingAddress:<redacted> ValidUntil:<redacted>}", c.ExpMonth, c.ExpYear)
 }
 
-// GoString returns a credential-safe Go-syntax summary of c.
-func (c Card) GoString() string { return c.String() }
-
 // Format ensures all common fmt verbs use the credential-safe summary.
 func (c Card) Format(state fmt.State, _ rune) { _, _ = state.Write([]byte(c.String())) }
 
@@ -187,9 +184,6 @@ func (t SharedPaymentToken) String() string {
 	return "SharedPaymentToken{ID:<redacted> BillingAddress:<redacted> ValidUntil:<redacted>}"
 }
 
-// GoString returns a credential-safe Go-syntax summary of t.
-func (t SharedPaymentToken) GoString() string { return t.String() }
-
 // Format ensures all common fmt verbs use the credential-safe summary.
 func (t SharedPaymentToken) Format(state fmt.State, _ rune) { _, _ = state.Write([]byte(t.String())) }
 
@@ -258,9 +252,6 @@ func (s SpendRequest) String() string {
 	return fmt.Sprintf("SpendRequest{ID:<redacted> Status:<redacted> Amount:%d Currency:<redacted> CredentialType:<redacted> Card:<redacted> SharedPaymentToken:<redacted> LinkPayToken:<redacted>}", s.Amount)
 }
 
-// GoString returns a credential-safe Go-syntax summary of s.
-func (s SpendRequest) GoString() string { return s.String() }
-
 // Format ensures all common fmt verbs use the credential-safe summary.
 func (s SpendRequest) Format(state fmt.State, _ rune) { _, _ = state.Write([]byte(s.String())) }
 
@@ -274,9 +265,6 @@ type RequestApprovalResponse struct {
 func (r RequestApprovalResponse) String() string {
 	return "RequestApprovalResponse{ID:<redacted> ApprovalLink:<redacted>}"
 }
-
-// GoString returns a safe Go-syntax summary of r.
-func (r RequestApprovalResponse) GoString() string { return r.String() }
 
 // Format ensures all common fmt verbs use the credential-safe summary.
 func (r RequestApprovalResponse) Format(state fmt.State, _ rune) {
@@ -373,40 +361,35 @@ func (b WebBotAuthBlock) String() string {
 	return "WebBotAuthBlock{Signature:<redacted> SignatureInput:<redacted> SignatureAgent:<redacted> Authority:<redacted> ExpiresAt:<redacted>}"
 }
 
-// GoString returns a credential-safe Go-syntax summary of b.
-func (b WebBotAuthBlock) GoString() string { return b.String() }
-
 // Format ensures all common fmt verbs use the credential-safe summary.
 func (b WebBotAuthBlock) Format(state fmt.State, _ rune) { _, _ = state.Write([]byte(b.String())) }
 
 // CreateSpendRequestParams are the parameters for
-// SpendRequestsResource.Create. Optional scalar fields are pointers so omit,
-// explicit false/zero, and explicit empty string remain distinct. Optional
-// slices use nil for omit and a non-nil empty slice for an explicit empty
-// array.
+// SpendRequestsResource.Create. Optional scalar zero values are omitted where
+// zero is equivalent to absence. Optional slices use nil for omission and a
+// non-nil empty slice for an explicit empty array.
 type CreateSpendRequestParams struct {
-	PaymentDetails string          `json:"payment_details"`
-	CredentialType *CredentialType `json:"credential_type,omitzero"`
-	NetworkID      *string         `json:"network_id,omitzero"`
+	PaymentDetails string         `json:"payment_details"`
+	CredentialType CredentialType `json:"credential_type,omitzero"`
+	NetworkID      string         `json:"network_id,omitzero"`
 
 	// Amount is in the smallest currency unit (cents).
-	Amount   *int64  `json:"amount,omitzero"`
-	Currency *string `json:"currency,omitzero"`
+	Amount   int64  `json:"amount,omitzero"`
+	Currency string `json:"currency,omitzero"`
 
-	MerchantName *string `json:"merchant_name,omitzero"`
-	MerchantURL  *string `json:"merchant_url,omitzero"`
+	MerchantName string `json:"merchant_name,omitzero"`
+	MerchantURL  string `json:"merchant_url,omitzero"`
 
 	Context string `json:"context"`
 
 	LineItems []LineItem `json:"line_items,omitzero"`
 	Totals    []Total    `json:"totals,omitzero"`
 
-	RequestApproval *bool `json:"request_approval,omitzero"`
-	Test            *bool `json:"test,omitzero"`
+	RequestApproval bool `json:"request_approval,omitzero"`
+	Test            bool `json:"test,omitzero"`
 
-	// Approve maps to routing, not the body: when true, Create POSTs to
-	// /spend_requests/create_delegated and the field is never serialized
-	// (parity: spend-request.ts:175-178, GUIDANCE §5.7).
+	// Approve selects the delegated creation endpoint and is never serialized.
+	// Callers need an access token granted the spend_requests:approve scope.
 	Approve bool `json:"-"`
 }
 

@@ -78,7 +78,8 @@ credential file.
 At least one reviewer who did not author the relevant implementation must
 inspect and record findings for:
 
-1. token rotation, generation checks, and last-waiter cancellation;
+1. token rotation, generation checks, and bounded persistence after waiter
+   cancellation;
 2. no automatic replay of spend/report/signing mutations;
 3. device-flow persistence, expiry, revoke, and logout transitions;
 4. credential-file path, permissions, symlink handling, bounds, atomicity,

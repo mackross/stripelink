@@ -51,9 +51,6 @@ func (r AccessTokenRequest) String() string {
 	return fmt.Sprintf("AccessTokenRequest{ForceRefresh:%t RejectedToken:<redacted>}", r.ForceRefresh)
 }
 
-// GoString returns the credential-safe structural summary.
-func (r AccessTokenRequest) GoString() string { return r.String() }
-
 // Format makes every fmt verb use the credential-safe summary.
 func (r AccessTokenRequest) Format(state fmt.State, _ rune) { _, _ = state.Write([]byte(r.String())) }
 
@@ -81,7 +78,8 @@ type Options struct {
 	// AccessToken when set.
 	GetAccessToken AccessTokenFunc
 
-	// AuthStorage persists OAuth tokens and pending device authorizations.
+	// AuthStorage loads, transactionally updates, and clears the complete OAuth
+	// and pending device-authorization state.
 	// It defaults to a FileStorage at the default path. When neither
 	// AccessToken nor GetAccessToken is set, NewClient wires a
 	// storage-backed auto-refreshing token provider on top of it.
@@ -140,9 +138,6 @@ func (o Options) String() string {
 	return fmt.Sprintf("Options{ClientName:<redacted> AccessToken:<redacted> GetAccessToken:<redacted> AuthStorage:<redacted> HTTPClient:<redacted> DefaultHeaders:<redacted> MaxResponseBodyBytes:%d AuthBaseURL:<redacted> APIBaseURL:<redacted> SpendRequestBaseURL:<redacted> Logger:<redacted> Verbose:%t}", o.MaxResponseBodyBytes, o.Verbose)
 }
 
-// GoString returns the credential-safe structural summary.
-func (o Options) GoString() string { return o.String() }
-
 // Format makes every fmt verb use the credential-safe summary.
 func (o Options) Format(state fmt.State, _ rune) { _, _ = state.Write([]byte(o.String())) }
 
@@ -180,9 +175,10 @@ type Client struct {
 // HTTP is accepted only for loopback hosts. Redirects are never followed, so
 // bearer tokens and caller-supplied headers cannot cross origins.
 //
-// The client applies no HTTP timeout of its own, matching the JS SDK;
-// cancellation and deadlines are the caller's job via the context passed to
-// each method.
+// The client applies no client-wide HTTP timeout, matching the JS SDK;
+// cancellation and deadlines for ordinary requests come from the context
+// passed to each method. A started automatic token refresh uses a bounded
+// internal context so caller cancellation cannot strand a successful rotation.
 func NewClient(opts Options) (*Client, error) {
 	clientName := opts.ClientName
 	if clientName == "" {

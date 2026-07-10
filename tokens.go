@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-const tokenExpirySkew = 60 * time.Second
+const (
+	tokenExpirySkew              = 60 * time.Second
+	detachedAuthOperationTimeout = 30 * time.Second
+)
 
 // tokenProvider is the storage-backed, auto-refreshing access-token source
 // that NewClient wires as the default AccessTokenFunc when neither
@@ -18,16 +21,16 @@ const tokenExpirySkew = 60 * time.Second
 // expires_at minus a small skew), calls AuthResource.RefreshToken and
 // persists the result.
 //
-// Refresh is single-flight: under concurrent demand exactly one RefreshToken
-// call happens and the others wait for and reuse its result, because refresh
-// tokens may be single-use server-side (GUIDANCE §7).
+// Refresh is single-flight within one tokenProvider: concurrent callers wait
+// for and reuse one RefreshToken result (GUIDANCE §7). Independent Clients do
+// not coordinate network calls; applications needing that guarantee should own
+// one Client in their process or service.
 type tokenProvider struct {
 	storage AuthStorage
 	auth    *AuthResource
 
 	// decision serializes the gap between reading storage and publishing a new
-	// refreshCall. It is distinct from mu so waiter cancellation remains able
-	// to update an in-flight call while its storage transaction is on the wire.
+	// refreshCall.
 	decision storageGate
 	mu       sync.Mutex
 	// inflight is non-nil while a refresh is running; waiters block on done
@@ -38,12 +41,11 @@ type tokenProvider struct {
 
 // refreshCall carries the shared result of one in-flight token refresh.
 type refreshCall struct {
-	done   chan struct{} // closed when the refresh completes
-	cancel context.CancelFunc
+	done chan struct{} // closed when the refresh completes
 
-	// waiters is protected by tokenProvider.mu. When it reaches zero before
-	// completion, the call is detached and canceled so it cannot later persist
-	// credentials after every interested caller has returned.
+	// waiters is protected by tokenProvider.mu and is diagnostic only. Once a
+	// refresh starts it completes independently of waiter cancellation so a
+	// successful remote token rotation is still persisted.
 	waiters int
 	tokens  *AuthTokens
 	err     error
@@ -54,8 +56,8 @@ type refreshCall struct {
 // refresh it compares request.RejectedToken with the currently stored access
 // token; a mismatch means another caller already refreshed this generation,
 // so it returns the stored token without refreshing again. Each waiter may
-// stop waiting when its own context is canceled. Shared work continues while
-// at least one waiter remains and is canceled once the final waiter leaves.
+// stop waiting when its own context is canceled. Once started, shared work
+// continues under a bounded internal context so remote success can be persisted.
 func (p *tokenProvider) token(ctx context.Context, request AccessTokenRequest) (string, error) {
 	if err := requireContext(ctx); err != nil {
 		return "", err
@@ -64,10 +66,7 @@ func (p *tokenProvider) token(ctx context.Context, request AccessTokenRequest) (
 		return "", ErrNotAuthenticated
 	}
 
-	// Join local shared work before touching storage. A refresh transaction can
-	// deliberately hold the storage lock across the network exchange; trying to
-	// read first would strand same-provider callers behind that lock instead of
-	// letting them share its result.
+	// Join local shared work before touching storage.
 	p.mu.Lock()
 	if call := p.inflight; call != nil {
 		call.waiters++
@@ -91,14 +90,16 @@ func (p *tokenProvider) token(ctx context.Context, request AccessTokenRequest) (
 	p.mu.Unlock()
 
 	var stored *AuthTokens
-	err := p.storage.Update(ctx, func(state *AuthStorageState) error {
-		stored = cloneAuth(state.Auth)
-		return nil
-	})
+	state, err := p.storage.Load(ctx)
 	if err != nil {
 		p.decision.unlock()
 		return "", fmt.Errorf("stripelink: load authentication: %w", err)
 	}
+	if state == nil {
+		p.decision.unlock()
+		return "", errors.New("stripelink: load authentication: storage returned nil state")
+	}
+	stored = cloneAuth(state.Auth)
 
 	p.mu.Lock()
 	if call := p.inflight; call != nil {
@@ -134,20 +135,22 @@ func (p *tokenProvider) token(ctx context.Context, request AccessTokenRequest) (
 		return "", ErrNotAuthenticated
 	}
 
-	// Shared refresh work inherits values from the initiating caller, while
-	// cancellation is reference-counted across all waiters below. This avoids
-	// one canceled waiter aborting work still needed by another caller.
-	refreshCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	// Shared refresh work inherits values from the initiating caller but has its
+	// own bounded lifetime. Individual callers may stop waiting without making a
+	// successful remote rotation impossible to persist.
+	refreshCtx, cancel := detachedAuthContext(ctx)
 	call := &refreshCall{
 		done:    make(chan struct{}),
-		cancel:  cancel,
 		waiters: 1,
 	}
 	p.inflight = call
 	p.mu.Unlock()
 	p.decision.unlock()
 
-	go p.runRefresh(refreshCtx, call, stored)
+	go func() {
+		defer cancel()
+		p.runRefresh(refreshCtx, call, stored)
+	}()
 	return p.waitForRefresh(ctx, call)
 }
 
@@ -155,45 +158,55 @@ func tokenNeedsRefresh(tokens *AuthTokens, now time.Time) bool {
 	return tokens.ExpiresAt > 0 && !now.Before(time.UnixMilli(tokens.ExpiresAt).Add(-tokenExpirySkew))
 }
 
+func detachedAuthContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), detachedAuthOperationTimeout)
+}
+
 func (p *tokenProvider) runRefresh(ctx context.Context, call *refreshCall, source *AuthTokens) {
-	var tokens *AuthTokens
-	err := p.storage.Update(ctx, func(state *AuthStorageState) error {
+	refreshed, err := p.auth.RefreshToken(ctx, source.RefreshToken)
+	if err != nil {
+		// Another Client or process may have completed the same generation while
+		// this request was in flight. Prefer that committed generation over a
+		// redundant refresh failure.
+		if state, loadErr := p.storage.Load(ctx); loadErr == nil && state != nil &&
+			state.Auth != nil && state.Auth.AccessToken != "" && !sameAuthTokens(state.Auth, source) {
+			p.finishRefresh(call, cloneAuth(state.Auth), nil)
+			return
+		}
+		p.finishRefresh(call, nil, err)
+		return
+	}
+	if refreshed == nil || refreshed.AccessToken == "" || refreshed.RefreshToken == "" {
+		p.finishRefresh(call, nil, errors.New("stripelink: token refresh returned unusable credentials"))
+		return
+	}
+
+	commitCtx, cancel := detachedAuthContext(ctx)
+	defer cancel()
+	tokens := refreshed
+	err = p.storage.Transact(commitCtx, func(state *AuthStorageState) error {
 		current := state.Auth
 		switch {
 		case current == nil || current.AccessToken == "":
 			return ErrNotAuthenticated
-		case current.AccessToken != source.AccessToken || current.RefreshToken != source.RefreshToken:
+		case !sameAuthTokens(current, source):
 			// Another Client or process already committed a newer generation.
 			tokens = cloneAuth(current)
 			return nil
 		}
-		refreshed, refreshErr := p.auth.RefreshToken(ctx, source.RefreshToken)
-		if refreshErr != nil {
-			return refreshErr
-		}
-		if refreshed == nil || refreshed.AccessToken == "" || refreshed.RefreshToken == "" {
-			return errors.New("stripelink: token refresh returned unusable credentials")
-		}
-		tokens = refreshed
 		state.Auth = refreshed
 		return nil
 	})
+	if err != nil {
+		err = fmt.Errorf("stripelink: persist refreshed authentication: %w", err)
+		tokens = nil
+	}
+	p.finishRefresh(call, tokens, err)
+}
 
+func (p *tokenProvider) finishRefresh(call *refreshCall, tokens *AuthTokens, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	defer call.cancel()
-
-	// Cancellation that detached the call wins over a transport that ignored
-	// its context. Holding p.mu through persistence makes the transition
-	// ordered with the final waiter's cancellation: credentials can never be
-	// written after that waiter has returned.
-	active := p.inflight == call && call.waiters > 0 && ctx.Err() == nil
-	if err == nil && !active {
-		err = contextFailure(ctx)
-		if err == nil {
-			err = context.Canceled
-		}
-	}
 
 	call.tokens = tokens
 	call.err = err
@@ -222,10 +235,8 @@ func (p *tokenProvider) waitForRefresh(ctx context.Context, call *refreshCall) (
 			return refreshResult(call)
 		default:
 		}
-		call.waiters--
-		if call.waiters == 0 && p.inflight == call {
-			p.inflight = nil
-			call.cancel()
+		if call.waiters > 0 {
+			call.waiters--
 		}
 		p.mu.Unlock()
 		return "", contextFailure(ctx)

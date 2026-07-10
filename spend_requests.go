@@ -64,11 +64,10 @@ func (r *SpendRequestsResource) List(ctx context.Context) ([]SpendRequest, error
 	return requests, nil
 }
 
-// Create creates a spend request via POST /spend_requests. When
-// params.Approve is true the request is routed to
-// POST /spend_requests/create_delegated instead, and the Approve field itself
-// is never serialized (parity: spend-request.ts:175-178). A 401 response is
-// not automatically replayed because the API does not document an idempotency
+// Create creates a spend request via POST /spend_requests. When Approve is
+// true, it uses /spend_requests/create_delegated; that endpoint requires an
+// access token granted the spend_requests:approve scope. A 401 response is not
+// automatically replayed because the API does not document an idempotency
 // guarantee for this mutation.
 func (r *SpendRequestsResource) Create(ctx context.Context, params CreateSpendRequestParams) (*SpendRequest, error) {
 	if err := r.validate(ctx); err != nil {

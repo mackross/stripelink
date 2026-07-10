@@ -95,21 +95,8 @@ func TestSpendRequestsList(t *testing.T) {
 	}
 }
 
-func TestSpendRequestsCreatePresenceAndRouting(t *testing.T) {
-	falseValue, zero, empty := false, int64(0), ""
-	emptyItems := []LineItem{}
-	params := CreateSpendRequestParams{
-		PaymentDetails:  "pd_123",
-		Context:         "buy supplies",
-		Amount:          &zero,
-		Currency:        &empty,
-		MerchantName:    &empty,
-		LineItems:       emptyItems,
-		Totals:          []Total{},
-		RequestApproval: &falseValue,
-		Test:            &falseValue,
-		Approve:         true,
-	}
+func TestSpendRequestsCreateOmitsZeroValuesWithoutMutatingInput(t *testing.T) {
+	params := CreateSpendRequestParams{PaymentDetails: "pd_123", Context: "buy supplies"}
 	rt := &recordingTransport{}
 	rt.respond(http.StatusOK, validSpendRequestJSON)
 	created, err := newSpendTestClient(t, rt, nil).SpendRequests.Create(t.Context(), params)
@@ -120,7 +107,7 @@ func TestSpendRequestsCreatePresenceAndRouting(t *testing.T) {
 		t.Fatalf("created = %#v", created)
 	}
 	requests := rt.Requests()
-	if len(requests) != 1 || requests[0].Method != http.MethodPost || requests[0].URL != "https://spend.test/api/spend_requests/create_delegated" {
+	if len(requests) != 1 || requests[0].Method != http.MethodPost || requests[0].URL != "https://spend.test/api/spend_requests" {
 		t.Fatalf("request = %#v", requests)
 	}
 	if requests[0].Header.Get("Content-Type") != "application/json" {
@@ -130,32 +117,36 @@ func TestSpendRequestsCreatePresenceAndRouting(t *testing.T) {
 	if err := json.Unmarshal([]byte(requests[0].Body), &body); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"amount", "currency", "merchant_name", "line_items", "totals", "request_approval", "test"} {
-		if _, ok := body[key]; !ok {
-			t.Errorf("body omitted explicitly present %q: %s", key, requests[0].Body)
-		}
-	}
-	if _, ok := body["approve"]; ok {
-		t.Errorf("routing field serialized: %s", requests[0].Body)
-	}
-	if params.Approve != true || params.Amount != &zero || params.LineItems == nil {
-		t.Fatal("Create mutated caller parameters")
-	}
-
-	rt = &recordingTransport{}
-	rt.respond(http.StatusOK, validSpendRequestJSON)
-	_, err = newSpendTestClient(t, rt, nil).SpendRequests.Create(t.Context(), CreateSpendRequestParams{PaymentDetails: "pd_123", Context: "context"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var omitted map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(rt.Requests()[0].Body), &omitted); err != nil {
-		t.Fatal(err)
-	}
-	for _, key := range []string{"amount", "currency", "merchant_name", "line_items", "totals", "request_approval", "test", "approve"} {
-		if _, ok := omitted[key]; ok {
+	for _, key := range []string{"credential_type", "network_id", "amount", "currency", "merchant_name", "merchant_url", "line_items", "totals", "request_approval", "test"} {
+		if _, ok := body[key]; ok {
 			t.Errorf("body included omitted %q: %s", key, rt.Requests()[0].Body)
 		}
+	}
+	if params.PaymentDetails != "pd_123" || params.Context != "buy supplies" {
+		t.Fatal("Create mutated caller parameters")
+	}
+}
+
+func TestSpendRequestsCreateDelegatedRouting(t *testing.T) {
+	rt := &recordingTransport{}
+	rt.respond(http.StatusOK, validSpendRequestJSON)
+	params := CreateSpendRequestParams{PaymentDetails: "pd_123", Context: "delegated purchase", Approve: true}
+	if _, err := newSpendTestClient(t, rt, nil).SpendRequests.Create(t.Context(), params); err != nil {
+		t.Fatal(err)
+	}
+	request := rt.Requests()[0]
+	if request.URL != "https://spend.test/api/spend_requests/create_delegated" {
+		t.Fatalf("URL = %q", request.URL)
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(request.Body), &body); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := body["approve"]; ok {
+		t.Fatalf("routing flag was serialized: %s", request.Body)
+	}
+	if !params.Approve {
+		t.Fatal("Create mutated caller parameters")
 	}
 }
 
@@ -163,25 +154,24 @@ func TestSpendRequestsCreateNestedValuesWithoutPrecisionLoss(t *testing.T) {
 	const amount = int64(9007199254740991)
 	itemURL := "https://merchant.example/item"
 	quantity := 2
-	credentialType := CredentialType("future_credential")
-	networkID := "network_1"
-	merchantURL := "https://merchant.example"
 	rt := &recordingTransport{}
 	rt.respond(http.StatusOK, validSpendRequestJSON)
 	_, err := newSpendTestClient(t, rt, nil).SpendRequests.Create(t.Context(), CreateSpendRequestParams{
 		PaymentDetails: "pd_123",
-		CredentialType: &credentialType,
-		NetworkID:      &networkID,
-		Amount:         func() *int64 { value := amount; return &value }(),
-		Currency:       func() *string { value := "usd"; return &value }(),
-		MerchantURL:    &merchantURL,
+		CredentialType: "future_credential",
+		NetworkID:      "network_1",
+		Amount:         amount,
+		Currency:       "usd",
+		MerchantURL:    "https://merchant.example",
 		Context:        "buy nested item",
 		LineItems: []LineItem{{
 			Name: "Item", URL: &itemURL, Quantity: &quantity,
 			UnitAmount: func() *int64 { value := amount; return &value }(),
 			Totals:     []Total{{Type: "subtotal", DisplayText: "Subtotal", Amount: amount}},
 		}},
-		Totals: []Total{{Type: "total", DisplayText: "Total", Amount: amount}},
+		Totals:          []Total{{Type: "total", DisplayText: "Total", Amount: amount}},
+		RequestApproval: true,
+		Test:            true,
 	})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -190,7 +180,7 @@ func TestSpendRequestsCreateNestedValuesWithoutPrecisionLoss(t *testing.T) {
 	if err := json.Unmarshal([]byte(rt.Requests()[0].Body), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body.Amount == nil || *body.Amount != amount || len(body.LineItems) != 1 || body.LineItems[0].UnitAmount == nil || *body.LineItems[0].UnitAmount != amount || body.LineItems[0].Totals[0].Amount != amount || body.Totals[0].Amount != amount || body.CredentialType == nil || *body.CredentialType != "future_credential" {
+	if body.Amount != amount || len(body.LineItems) != 1 || body.LineItems[0].UnitAmount == nil || *body.LineItems[0].UnitAmount != amount || body.LineItems[0].Totals[0].Amount != amount || body.Totals[0].Amount != amount || body.CredentialType != "future_credential" || !body.RequestApproval || !body.Test {
 		t.Fatalf("request values lost: %#v", body)
 	}
 }
@@ -499,7 +489,7 @@ func TestSpendRequestsValidationBeforeHTTP(t *testing.T) {
 	rt := &recordingTransport{}
 	rt.respond(http.StatusOK, strings.Replace(validSpendRequestJSON, `"future_status"`, `"brand_new_status"`, 1))
 	created, err := newSpendTestClient(t, rt, nil).SpendRequests.Create(t.Context(), CreateSpendRequestParams{
-		PaymentDetails: "pd", Context: "ctx", CredentialType: func() *CredentialType { v := CredentialType("brand_new_credential"); return &v }(),
+		PaymentDetails: "pd", Context: "ctx", CredentialType: "brand_new_credential",
 	})
 	if err != nil || created.Status != "brand_new_status" {
 		t.Fatalf("forward-compatible values rejected: %#v, %v", created, err)

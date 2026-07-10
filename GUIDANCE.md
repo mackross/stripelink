@@ -321,9 +321,10 @@ func (a *AuthResource) Logout(ctx context.Context) error
   absence returns `ErrNoPendingDeviceAuth`. This keeps default storage private
   while making the persisted lifecycle usable across process restarts.
 - `Logout` reads the SDK-owned persisted tokens, revokes the refresh token,
-  and clears all auth state only after successful revocation. On revocation
-  failure credentials are retained for retry. Static-token and custom-provider
-  configurations are caller-owned and cannot be logged out by the SDK.
+  and clears all auth state after successful revocation or an `invalid_token`
+  response indicating it was already revoked. Other revocation failures retain
+  credentials for retry. Static-token and custom-provider configurations are
+  caller-owned and cannot be logged out by the SDK.
 - Direct `RefreshToken` and `RevokeToken` calls are low-level exchanges and do
   not mutate storage, even when their argument happens to match the current
   session. This prevents a caller-supplied token from overwriting or clearing
@@ -344,29 +345,29 @@ Go — same capabilities, error-returning, no singleton:
 
 ```go
 type AuthStorage interface {
-    GetAuth() (*AuthTokens, error)        // (nil, nil) = not authenticated
-    SetAuth(*AuthTokens) error            // must compute ExpiresAt if zero (§5.7)
-    ClearAuth() error
-    GetPendingDeviceAuth() (*PendingDeviceAuth, error) // expired entries cleared + (nil, nil)
-    SetPendingDeviceAuth(*PendingDeviceAuth) error
-    ClearPendingDeviceAuth() error
-    ClearAll() error
-    Update(context.Context, func(*AuthStorageState) error) error
+    Load(context.Context) (*AuthStorageState, error)
+    Transact(context.Context, func(*AuthStorageState) error) error
+    Clear(context.Context) error
 }
 ```
 
 All `AuthStorage` implementations are safe for concurrent use and obey value
-semantics: Get methods return defensive copies and Set methods copy their
-arguments. In-memory storage must not leak mutable pointers around its mutex.
-`Update` is the atomic session primitive: it locks the complete snapshot,
-passes defensive copies to the callback, and commits the complete result only
-when the callback and context succeed. Persistent custom stores must hold the
-same transaction/lock across processes through durable commit. Callbacks must
-not call back into the same storage.
+semantics: `Load` and `Transact` return or receive defensive snapshots, and
+in-memory storage must not leak mutable pointers around its mutex. `Transact`
+locks the complete state, passes a defensive copy to the callback, and commits
+the complete result only when the callback and context succeed. Persistent
+custom stores must hold the same transaction/lock across processes through
+durable commit. Callbacks must be deterministic local state transitions: they
+must not call back into the same storage, perform network I/O, or have external
+side effects. Refresh HTTP runs outside the transaction; only the
+generation-check and durable replacement are transacted.
+`Clear` atomically removes all auth and pending-flow state. Field-specific
+transitions are expressed explicitly inside `Transact`.
 
-`Path() string` and `Delete() error` are **not** part of the interface — they
-are file-storage concerns, so they live as concrete methods on `*FileStorage`
-only (`Delete` treats a missing file as success, parity `storage.ts:133-139`).
+`Path() string` and `Delete(context.Context) error` are **not** part of the
+interface — they are file-storage concerns, so they live as concrete methods
+on `*FileStorage` only (`Delete` treats a missing file as success, parity
+`storage.ts:133-139`).
 The JS interface fakes them for `MemoryStorage` (`getPath()` returns the
 string `"memory"`, `deleteConfig()` no-ops, `storage.ts:188-194`) — that wart
 is not ported. Callers holding the interface who need the path can type-assert
@@ -398,7 +399,8 @@ has tokens. It returns the stored access token while valid, and on
 `forceRefresh` (or expiry, using `expires_at` minus a small skew) calls
 `Auth.RefreshToken` and persists the result. This logic lives in the CLI in
 JS-land; the README promises "tokens are refreshed transparently", so in Go it
-is part of the SDK. **It must be generation-aware and single-flight** (§7).
+is part of the SDK. **It must be generation-aware and single-flight within one
+token provider** (§7).
 On a forced refresh it compares `AccessTokenRequest.RejectedToken` with the
 current stored access token before joining or starting a refresh. If they
 differ, it returns the current token without refreshing.
@@ -408,15 +410,15 @@ differ, it returns the current token without refreshing.
 General rules (`types.go`):
 - Field names CamelCase, json tags snake_case, matching `types/index.ts`
   exactly. Amounts are `int64` (cents). Counts like `exp_month` are `int`.
-- **Request params**: every optional scalar is a pointer. `nil` means omitted;
-  a non-nil pointer preserves explicit `false`, `0`, and `""`. Optional slices
-  use `omitzero`: nil means omitted and a non-nil empty slice means an explicit
-  empty array. Do not use value scalars with `omitzero` where presence is part
-  of the API contract. The serialized body must omit unset fields exactly as
-  `JSON.stringify` drops `undefined` — the JS tests assert exact bodies.
-  `CreateSpendRequestParams.Approve` maps to routing, not the body: when true,
-  POST to `/spend_requests/create_delegated` and **strip the field from the
-  payload** (`spend-request.ts:175-178`) → tag it `json:"-"`.
+- **Request params**: create-only optional scalars use ordinary zero values with
+  `omitzero` when zero/false/empty is invalid or equivalent to omission. Update
+  scalars remain pointers where callers must distinguish omission from an
+  explicit clear or zero. Optional slices use `omitzero`: nil means omitted and
+  a non-nil empty slice means an explicit empty array.
+  `CreateSpendRequestParams.Approve` selects `/spend_requests/create_delegated`
+  without serializing the routing flag. That endpoint requires an access token
+  granted `spend_requests:approve`; the default public Link CLI scope does not
+  include it.
 - **Response fields**: value types where absence ≡ zero; pointers where the
   wire is explicitly nullable and callers must distinguish (`UserInfo` fields,
   `PaymentStatusDetails`, `ShippingAddress` fields — all `| null` in TS).
@@ -487,8 +489,9 @@ add the endpoint here.
 4. Resource interfaces not exported.
 5. Config resolved once per client, not per resource.
 6. One shared transport core instead of six divergent copies.
-7. Storage methods return errors; no package-level singleton; `Path`/`Delete`
-   are `*FileStorage`-only methods, dropped from the `AuthStorage` interface.
+7. Storage exposes complete-state `Load`/`Transact`/`Clear` operations instead
+   of the JS field-by-field interface; methods return errors; there is no
+   package-level singleton; `Path`/`Delete` remain `*FileStorage` concerns.
 8. Storage-backed auto-refresh token provider is part of the SDK (in JS it
    lives in the CLI).
 9. Blocking `PollDeviceAuth` helper added (JS CLI loops externally).
@@ -515,7 +518,7 @@ add the endpoint here.
 20. Base URLs, redirects, and default headers are constrained to prevent
     bearer-token disclosure and HTTP routing/framing confusion.
 21. API/transport errors retain explicit structured fields for inspection, but
-    implicit `Error`, `String`, `GoString`, and `fmt.Formatter` output is
+    implicit `Error`, `String`, and `fmt.Formatter` output is
     bounded and credential-safe. Unstructured bodies are not echoed into error
     strings.
 
@@ -525,22 +528,22 @@ add the endpoint here.
 - Lazily-thrown configuration errors where up-front validation is possible.
 - `getPath()`/`deleteConfig()` on the storage *interface*. They are
   file-storage-specific (MemoryStorage fakes them with `"memory"` / a no-op);
-  in Go they exist only on `*FileStorage`, as `Path()`/`Delete()`.
+  in Go they exist only on `*FileStorage`, as `Path()`/`Delete(ctx)`.
 
 ## 7. Concurrency (Go-only concerns — JS was single-threaded)
 
 The JS SDK never had to think about races. The Go SDK is presumed to be used
 from many goroutines. Required:
 
-1. **Generation-aware single-flight token refresh.** Under concurrent 401s,
-   exactly one `RefreshToken` call happens; the others wait and reuse its
-   result. Before starting or joining refresh, compare the rejected token with
-   current storage: a mismatch means rotation already completed. Refresh
-   tokens may be single-use server-side — a duplicate refresh can invalidate
-   the session. Hand-roll with `sync.Mutex` + in-flight result sharing; no
-   `x/sync` dependency. The goroutine that starts the network refresh owns its
-   context. Waiters select on their own context and the shared completion;
-   canceling a waiter never cancels the shared refresh.
+1. **Generation-aware single-flight token refresh.** Within one token provider,
+   concurrent 401s cause exactly one `RefreshToken` call; the others wait and
+   reuse its result. Before starting or joining refresh, compare the rejected
+   token with current storage: a mismatch means rotation already completed.
+   Hand-roll with `sync.Mutex` + in-flight result sharing; no `x/sync`
+   dependency. Waiters select on their own context and shared completion, but
+   once started the bounded refresh continues so a successful remote rotation
+   can be persisted. Independent Clients may issue concurrent refreshes; a
+   daemon or application requiring global serialization must own one Client.
 2. **Web-bot-auth cache** is `sync.Mutex`-guarded; concurrent `SignURL` calls
    for the same authority must single-flight with independent waiter
    cancellation and initiator-owned network context.
@@ -613,14 +616,15 @@ and a fresh security review.
 2. **Refresh and revoke storage semantics:** direct `RefreshToken` and
    `RevokeToken` calls do not mutate storage. The automatic token provider
    persists a complete successful refresh before use. `Logout` revokes the
-   persisted refresh token and clears all persisted state only after successful
-   revocation; failure retains the session.
-3. **Optional field shape:** optional request scalars use pointers and optional
-   slices preserve nil versus non-nil empty. Spend creation requires non-empty
-   `PaymentDetails` and `Context`; spend IDs and nested item/total structure
-   are checked locally. Report values are encoded faithfully and changeable
-   report business rules remain server-owned. Unknown string-enum values
-   remain accepted.
+   persisted refresh token and clears all persisted state after success or an
+   already-invalid response; other failures retain the session.
+3. **Optional field shape:** create-only optional scalars use zero values where
+   zero is equivalent to omission; update scalars use pointers where presence
+   matters. Optional slices preserve nil versus non-nil empty. Spend creation
+   requires non-empty `PaymentDetails` and `Context`; spend IDs and nested
+   item/total structure are checked locally. Report values are encoded
+   faithfully and changeable report business rules remain server-owned.
+   Unknown string-enum values remain accepted.
 4. **Storage locking and directory durability:** Darwin, DragonFly BSD,
    FreeBSD, Linux, NetBSD, and OpenBSD use an owner-only advisory `flock`
    companion file and directory fsync. Other platforms have per-instance
