@@ -377,6 +377,9 @@ func TestFileStorageRejectsUnsafeOrInvalidFiles(t *testing.T) {
 	})
 
 	t.Run("untraversable path", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Windows reports a child of a regular file as a missing path")
+		}
 		parent := filepath.Join(t.TempDir(), "not-a-directory")
 		if err := os.WriteFile(parent, []byte("ordinary file"), 0o600); err != nil {
 			t.Fatal(err)
@@ -720,10 +723,24 @@ func TestFileStorageMissingAndDeleteAreIdempotent(t *testing.T) {
 	}
 }
 
+func TestFileStorageCoordinatesConcurrentAccess(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.json")
+	storage, _ := NewFileStorage(path)
+	assertFileStorageCoordinatesUpdates(t, storage, storage)
+}
+
 func TestFileStorageCoordinatesInstances(t *testing.T) {
+	if !crossProcessStorageLockSupported {
+		t.Skip("cross-instance advisory locking is unavailable")
+	}
 	path := filepath.Join(t.TempDir(), "auth.json")
 	a, _ := NewFileStorage(path)
 	b, _ := NewFileStorage(path)
+	assertFileStorageCoordinatesUpdates(t, a, b)
+}
+
+func assertFileStorageCoordinatesUpdates(t *testing.T, a, b *FileStorage) {
+	t.Helper()
 	for range 20 {
 		if err := clearStoredState(a); err != nil {
 			t.Fatal(err)
