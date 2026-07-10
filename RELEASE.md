@@ -48,10 +48,10 @@ go vet ./...
 test -z "$(go fix -diff ./...)"
 go test ./... -count=1
 go test -race ./... -count=10
-go test ./... -run='^$' -fuzz=FuzzSharedPaymentTokenUnmarshal -fuzztime=10s
-go test ./... -run='^$' -fuzz=FuzzExtractAPIErrorMessage -fuzztime=10s
-go test ./... -run='^$' -fuzz=FuzzWebBotURLParsingDoesNotDiscloseSecrets -fuzztime=10s
-go test ./... -run='^$' -fuzz=FuzzStorageStateDecode -fuzztime=10s
+go test . -run='^$' -fuzz=FuzzSharedPaymentTokenUnmarshal -fuzztime=10s
+go test . -run='^$' -fuzz=FuzzExtractAPIErrorMessage -fuzztime=10s
+go test . -run='^$' -fuzz=FuzzWebBotURLParsingDoesNotDiscloseSecrets -fuzztime=10s
+go test . -run='^$' -fuzz=FuzzStorageStateDecode -fuzztime=10s
 GOBIN="$PWD/.release-tools" go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
 GOBIN="$PWD/.release-tools" go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
 .release-tools/staticcheck -version
