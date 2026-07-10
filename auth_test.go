@@ -1,7 +1,9 @@
 package stripelink
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -149,9 +151,70 @@ func TestAuthNilContextsAndCredentialSafeErrors(t *testing.T) {
 	if !ok || apiErr.Code != "invalid_grant" {
 		t.Fatalf("error = %#v", err)
 	}
-	formatted := fmt.Sprintf("%v %#v %s %s", err, err, apiErr.RawBody, apiErr.Details)
+	formatted := fmt.Sprintf("%s %v %+v %#v", err, err, err, err)
 	if strings.Contains(formatted, secret) {
 		t.Fatalf("authentication error disclosed credential: %s", formatted)
+	}
+}
+
+func TestAuthAPIErrorsRetainExplicitPayloadButFormatAndLogSafely(t *testing.T) {
+	const (
+		descriptionCanary = "oauth_description_financial_canary"
+		bodyCanary        = "oauth_body_financial_canary"
+	)
+	structuredBody := `{"error":"invalid_grant","error_description":"` + descriptionCanary + `","request_id":"req_auth_123","refresh_token":"` + bodyCanary + `"}`
+	for _, tc := range []struct {
+		name        string
+		status      int
+		body        string
+		wantCode    string
+		wantDetails bool
+	}{
+		{name: "structured OAuth", status: http.StatusBadRequest, body: structuredBody, wantCode: "invalid_grant", wantDetails: true},
+		{name: "non-JSON gateway", status: http.StatusBadGateway, body: "gateway " + bodyCanary, wantCode: "api_error", wantDetails: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := &recordingTransport{}
+			rt.respond(tc.status, tc.body)
+			logger, captured := newCapturingLogger()
+			client, err := NewClient(Options{
+				AuthStorage: &MemoryStorage{}, HTTPClient: rt.client(), AuthBaseURL: "https://auth.test",
+				Logger: logger, Verbose: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.Auth.RefreshToken(t.Context(), "request_refresh_secret")
+			apiErr, ok := errors.AsType[*APIError](err)
+			if !ok {
+				t.Fatalf("error = %T, want *APIError", err)
+			}
+			if apiErr.Status != tc.status || apiErr.Code != tc.wantCode || apiErr.RawBody != tc.body {
+				t.Fatalf("explicit error = code=%q status=%d raw=%q", apiErr.Code, apiErr.Status, apiErr.RawBody)
+			}
+			if tc.wantDetails {
+				if !json.Valid(apiErr.Details) || !bytes.Equal(apiErr.Details, []byte(tc.body)) {
+					t.Fatalf("Details = %q", apiErr.Details)
+				}
+				var details map[string]any
+				if err := json.Unmarshal(apiErr.Details, &details); err != nil || details["request_id"] != "req_auth_123" || details["refresh_token"] != bodyCanary {
+					t.Fatalf("inspect Details = %#v, %v", details, err)
+				}
+			} else if apiErr.Details != nil {
+				t.Fatalf("non-JSON Details = %q, want nil", apiErr.Details)
+			}
+
+			implicit := fmt.Sprintf("%s\n%v\n%+v\n%#v", err, err, err, err)
+			logs := strings.Join(captured.Lines(), "\n")
+			for _, canary := range []string{descriptionCanary, bodyCanary, tc.body} {
+				if strings.Contains(implicit, canary) {
+					t.Errorf("implicit formatting leaked %q: %s", canary, implicit)
+				}
+				if strings.Contains(logs, canary) {
+					t.Errorf("verbose logs leaked %q: %s", canary, logs)
+				}
+			}
+		})
 	}
 }
 

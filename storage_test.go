@@ -541,6 +541,122 @@ func TestFileStorageAtomicWriteFaultBoundaries(t *testing.T) {
 	}
 }
 
+func TestFileStorageUpdateCancellationBeforeCommit(t *testing.T) {
+	for _, boundary := range []string{"temporary write", "temporary sync"} {
+		t.Run(boundary, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "auth.json")
+			storage, err := NewFileStorage(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			original := validAuth()
+			original.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
+			if err := storage.SetAuth(original); err != nil {
+				t.Fatal(err)
+			}
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			switch boundary {
+			case "temporary write":
+				write := storage.ops.write
+				storage.ops.write = func(file *os.File, data []byte) (int, error) {
+					n, err := write(file, data)
+					cancel()
+					return n, err
+				}
+			case "temporary sync":
+				syncFile := storage.ops.sync
+				storage.ops.sync = func(file *os.File) error {
+					err := syncFile(file)
+					cancel()
+					return err
+				}
+			}
+
+			replacement := validAuth()
+			replacement.AccessToken = "at_must_not_persist"
+			replacement.ExpiresAt = original.ExpiresAt + 1
+			err = storage.Update(ctx, func(state *AuthStorageState) error {
+				state.Auth = replacement
+				return nil
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Update error = %v, want context cancellation", err)
+			}
+
+			storage.ops = defaultStorageFileOps()
+			reader, err := NewFileStorage(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for range 100 {
+				runtime.Gosched()
+				got, err := reader.GetAuth()
+				if err != nil {
+					t.Fatalf("last valid credentials unreadable: %v", err)
+				}
+				if *got != *original {
+					t.Fatalf("credentials persisted after cancellation: %#v", got)
+				}
+			}
+			temps, err := filepath.Glob(filepath.Join(dir, ".auth-*.tmp"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(temps) != 0 {
+				t.Fatalf("credential-bearing temporary files remain: %v", temps)
+			}
+		})
+	}
+}
+
+func TestFileStorageUpdateCancellationAfterRenameReportsDurabilityError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "auth.json")
+	storage, err := NewFileStorage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.SetAuth(validAuth()); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	rename := storage.ops.rename
+	storage.ops.rename = func(oldPath, newPath string) error {
+		if err := rename(oldPath, newPath); err != nil {
+			return err
+		}
+		cancel()
+		return nil
+	}
+	durabilityFailure := errors.New("injected directory durability failure")
+	storage.ops.syncDirectory = func(string) error { return durabilityFailure }
+	replacement := validAuth()
+	replacement.AccessToken = "at_committed"
+	err = storage.Update(ctx, func(state *AuthStorageState) error {
+		state.Auth = replacement
+		return nil
+	})
+	if !errors.Is(err, durabilityFailure) {
+		t.Fatalf("Update error = %v, want durability failure", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("post-commit cancellation masked commit state: %v", err)
+	}
+
+	reader, _ := NewFileStorage(path)
+	got, err := reader.GetAuth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccessToken != replacement.AccessToken {
+		t.Fatalf("committed credentials = %#v", got)
+	}
+}
+
 func TestFileStorageMissingAndDeleteAreIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "auth.json")
 	storage, _ := NewFileStorage(path)

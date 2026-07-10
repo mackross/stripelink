@@ -616,7 +616,7 @@ func (s *FileStorage) withState(ctx context.Context, createDirectory bool, updat
 	if err != nil || !changed {
 		return err
 	}
-	return writeStorageState(s.path, state, s.ops)
+	return writeStorageState(ctx, s.path, state, s.ops)
 }
 
 func newStorageState() storageState {
@@ -817,13 +817,22 @@ func (s storageState) pending() (*PendingDeviceAuth, error) {
 	return &pending, nil
 }
 
-func writeStorageState(path string, state storageState, ops storageFileOps) error {
+func writeStorageState(ctx context.Context, path string, state storageState, ops storageFileOps) error {
+	if err := contextFailure(ctx); err != nil {
+		return err
+	}
 	if err := validateStorageDestination(path); err != nil {
+		return err
+	}
+	if err := contextFailure(ctx); err != nil {
 		return err
 	}
 	data, err := ops.marshal(state)
 	if err != nil {
 		return fmt.Errorf("encode auth storage file: %w", err)
+	}
+	if err := contextFailure(ctx); err != nil {
+		return err
 	}
 	dir := filepath.Dir(path)
 	temp, err := ops.createTemp(dir, ".auth-*.tmp")
@@ -855,19 +864,41 @@ func writeStorageState(path string, state storageState, ops storageFileOps) erro
 		_ = ops.close(temp)
 		return cleanup(fmt.Errorf("%s auth storage file: %w", operation, cause))
 	}
+	if err := contextFailure(ctx); err != nil {
+		return cleanup(err)
+	}
 	if err := temp.Chmod(0o600); err != nil {
 		return fail("secure temporary", err)
+	}
+	if err := contextFailure(ctx); err != nil {
+		return cleanup(err)
 	}
 	if _, err := ops.write(temp, data); err != nil {
 		return fail("write temporary", err)
 	}
+	if err := contextFailure(ctx); err != nil {
+		return cleanup(err)
+	}
 	if err := ops.sync(temp); err != nil {
 		return fail("sync temporary", err)
+	}
+	if err := contextFailure(ctx); err != nil {
+		return cleanup(err)
 	}
 	if err := ops.close(temp); err != nil {
 		return cleanup(fmt.Errorf("close temporary auth storage file: %w", err))
 	}
+	if err := contextFailure(ctx); err != nil {
+		return cleanup(err)
+	}
 	if err := validateStorageDestination(path); err != nil {
+		return cleanup(err)
+	}
+	// This is the final cancellation checkpoint. Once rename begins, the new
+	// file may be committed; cancellation after that point cannot truthfully be
+	// reported as an uncommitted transaction and must not mask durability
+	// errors from the directory sync.
+	if err := contextFailure(ctx); err != nil {
 		return cleanup(err)
 	}
 	if err := ops.rename(tempPath, path); err != nil {

@@ -454,7 +454,7 @@ func absoluteExpiry(now time.Time, seconds int64) (int64, bool) {
 func authAPIError(prefix string, status int, body []byte, data json.RawMessage) *APIError {
 	code, _ := oauthError(data)
 	code = safeOAuthCode(code)
-	return newAuthAPIError(code, fmt.Sprintf("%s (%d): %s", prefix, status, code), status, nil, nil)
+	return newAuthAPIError(code, fmt.Sprintf("%s (%d): %s", prefix, status, code), status, body, data)
 }
 
 func newAuthAPIError(code, message string, status int, body []byte, data json.RawMessage) *APIError {
@@ -463,6 +463,8 @@ func newAuthAPIError(code, message string, status int, body []byte, data json.Ra
 		Code:    code,
 		Message: message,
 		Status:  status,
+		RawBody: string(body),
+		Details: append(json.RawMessage(nil), data...),
 	}
 }
 
